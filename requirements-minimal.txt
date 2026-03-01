@@ -1,0 +1,10 @@
+# Same as requirements.txt but without librosa (and its numba/llvmlite deps).
+# Use this on Intel Macs to avoid building llvmlite (no wheel for macos x86_64),
+# or when you don't need librosa's audio analysis features.
+# For basic audio I/O you can use: soundfile, scipy (add below if needed).
+
+mediapipe
+opencv-python
+yt-dlp
+ffmpeg-python
+numpy

@@ -1,0 +1,12 @@
+# Build fix: setuptools 70+ breaks llvmlite (librosa/numba) with "spawn() got dry_run".
+# Use two-step install from README so llvmlite builds with this setuptools.
+setuptools>=58,<70
+wheel
+
+mediapipe==0.10.14
+numpy>=1.24,<2
+opencv-python>=4.5,<4.10
+yt-dlp
+ffmpeg-python
+numpy
+librosa

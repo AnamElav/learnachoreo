@@ -1,0 +1,372 @@
+{
+  "video_id": "bY3IC-U3e1c",
+  "source_url": "https://www.youtube.com/watch?v=bY3IC-U3e1c",
+  "quality_assessment": {
+    "overall_score": 0.8724982898120514,
+    "confidence_score": 0.8564616335023855,
+    "continuity_score": 0.9946987951807229,
+    "coverage_score": 0.7663344407530454,
+    "flags": [
+      "camera_cuts_detected"
+    ]
+  },
+  "segments": [
+    {
+      "segment_id": 0,
+      "start_frame": 1,
+      "end_frame": 124,
+      "start_time_ms": 100.0,
+      "end_time_ms": 12400.0,
+      "beat_count": 23,
+      "angle_summary": {
+        "left_elbow": 124.66996391542004,
+        "right_elbow": 125.41735919054052,
+        "left_knee": 81.07301340394476,
+        "right_knee": 85.95795248913352,
+        "left_shoulder": 49.64212293814211,
+        "right_shoulder": 44.68492900014666,
+        "hip_tilt": 9.502259207610273
+      }
+    },
+    {
+      "segment_id": 1,
+      "start_frame": 124,
+      "end_frame": 244,
+      "start_time_ms": 12400.0,
+      "end_time_ms": 24400.0,
+      "beat_count": 21,
+      "angle_summary": {
+        "left_elbow": 119.37879294990256,
+        "right_elbow": 124.45042054122071,
+        "left_knee": 125.3443708886878,
+        "right_knee": 121.33204728446178,
+        "left_shoulder": 50.88501135657006,
+        "right_shoulder": 54.43993448968823,
+        "hip_tilt": 9.862750883909031
+      }
+    },
+    {
+      "segment_id": 2,
+      "start_frame": 244,
+      "end_frame": 359,
+      "start_time_ms": 24400.0,
+      "end_time_ms": 35900.0,
+      "beat_count": 22,
+      "angle_summary": {
+        "left_elbow": 133.72078931322233,
+        "right_elbow": 124.64433062261529,
+        "left_knee": 125.11459292619732,
+        "right_knee": 131.02653900680411,
+        "left_shoulder": 83.00830639719769,
+        "right_shoulder": 78.19913721736408,
+        "hip_tilt": 16.09237119104666
+      }
+    },
+    {
+      "segment_id": 3,
+      "start_frame": 359,
+      "end_frame": 479,
+      "start_time_ms": 35900.0,
+      "end_time_ms": 47900.0,
+      "beat_count": 22,
+      "angle_summary": {
+        "left_elbow": 116.23547709089688,
+        "right_elbow": 119.48847752206387,
+        "left_knee": 114.8072768642724,
+        "right_knee": 121.65471175882239,
+        "left_shoulder": 52.41866223232178,
+        "right_shoulder": 65.7934373574186,
+        "hip_tilt": 10.97920680030158
+      }
+    },
+    {
+      "segment_id": 4,
+      "start_frame": 479,
+      "end_frame": 604,
+      "start_time_ms": 47900.0,
+      "end_time_ms": 60400.0,
+      "beat_count": 22,
+      "angle_summary": {
+        "left_elbow": 118.32394263719478,
+        "right_elbow": 111.60658663546339,
+        "left_knee": 115.59143692680179,
+        "right_knee": 117.38976688384514,
+        "left_shoulder": 48.42124530149815,
+        "right_shoulder": 46.49108963168058,
+        "hip_tilt": 8.781483077856972
+      }
+    },
+    {
+      "segment_id": 5,
+      "start_frame": 604,
+      "end_frame": 730,
+      "start_time_ms": 60400.0,
+      "end_time_ms": 73000.0,
+      "beat_count": 24,
+      "angle_summary": {
+        "left_elbow": 123.462709106798,
+        "right_elbow": 122.23502169557655,
+        "left_knee": 124.03529827003487,
+        "right_knee": 127.72792007855345,
+        "left_shoulder": 43.80682393099158,
+        "right_shoulder": 37.567962329036995,
+        "hip_tilt": 46.01670896799479
+      }
+    },
+    {
+      "segment_id": 6,
+      "start_frame": 730,
+      "end_frame": 855,
+      "start_time_ms": 73000.0,
+      "end_time_ms": 85500.0,
+      "beat_count": 23,
+      "angle_summary": {
+        "left_elbow": 121.23102431470893,
+        "right_elbow": 124.43682360672341,
+        "left_knee": 126.67909669350803,
+        "right_knee": 134.84991677273575,
+        "left_shoulder": 54.741879200460495,
+        "right_shoulder": 55.10489395102135,
+        "hip_tilt": 54.929270851602894
+      }
+    },
+    {
+      "segment_id": 7,
+      "start_frame": 855,
+      "end_frame": 975,
+      "start_time_ms": 85500.0,
+      "end_time_ms": 97500.0,
+      "beat_count": 21,
+      "angle_summary": {
+        "left_elbow": 129.4975814529923,
+        "right_elbow": 124.24892347105872,
+        "left_knee": 124.24132722728686,
+        "right_knee": 132.4155472030197,
+        "left_shoulder": 73.04507402505077,
+        "right_shoulder": 73.33814024595223,
+        "hip_tilt": 30.215438127936267
+      }
+    },
+    {
+      "segment_id": 8,
+      "start_frame": 975,
+      "end_frame": 1090,
+      "start_time_ms": 97500.0,
+      "end_time_ms": 109000.0,
+      "beat_count": 22,
+      "angle_summary": {
+        "left_elbow": 117.72586298181004,
+        "right_elbow": 128.2669495092428,
+        "left_knee": 117.9575479229344,
+        "right_knee": 125.00488356374767,
+        "left_shoulder": 58.59738216788904,
+        "right_shoulder": 55.61960009937312,
+        "hip_tilt": 5.03142354836527
+      }
+    },
+    {
+      "segment_id": 9,
+      "start_frame": 1090,
+      "end_frame": 1210,
+      "start_time_ms": 109000.0,
+      "end_time_ms": 121000.0,
+      "beat_count": 22,
+      "angle_summary": {
+        "left_elbow": 123.29048259646855,
+        "right_elbow": 120.75588136324012,
+        "left_knee": 119.15915854353558,
+        "right_knee": 124.91302941692335,
+        "left_shoulder": 43.64193581268058,
+        "right_shoulder": 43.76345910930815,
+        "hip_tilt": 9.901135884875904
+      }
+    },
+    {
+      "segment_id": 10,
+      "start_frame": 1210,
+      "end_frame": 1330,
+      "start_time_ms": 121000.0,
+      "end_time_ms": 133000.0,
+      "beat_count": 22,
+      "angle_summary": {
+        "left_elbow": 124.31481795795929,
+        "right_elbow": 125.9952328412721,
+        "left_knee": 110.28351744829546,
+        "right_knee": 118.35379053218888,
+        "left_shoulder": 46.23493420266361,
+        "right_shoulder": 53.824375773326636,
+        "hip_tilt": 5.7022849114788725
+      }
+    },
+    {
+      "segment_id": 11,
+      "start_frame": 1330,
+      "end_frame": 1455,
+      "start_time_ms": 133000.0,
+      "end_time_ms": 145500.0,
+      "beat_count": 23,
+      "angle_summary": {
+        "left_elbow": 123.53076493532798,
+        "right_elbow": 121.3900063871784,
+        "left_knee": 111.42795598017945,
+        "right_knee": 117.02443558730745,
+        "left_shoulder": 58.68401830652957,
+        "right_shoulder": 68.41633094977522,
+        "hip_tilt": 6.408132989793403
+      }
+    },
+    {
+      "segment_id": 12,
+      "start_frame": 1455,
+      "end_frame": 1575,
+      "start_time_ms": 145500.0,
+      "end_time_ms": 157500.0,
+      "beat_count": 21,
+      "angle_summary": {
+        "left_elbow": 120.90564246202956,
+        "right_elbow": 123.46170328599703,
+        "left_knee": 120.99006423244914,
+        "right_knee": 122.24379850517613,
+        "left_shoulder": 51.24001197102414,
+        "right_shoulder": 44.04762579384697,
+        "hip_tilt": 9.209205195501573
+      }
+    },
+    {
+      "segment_id": 13,
+      "start_frame": 1575,
+      "end_frame": 1693,
+      "start_time_ms": 157500.0,
+      "end_time_ms": 169300.0,
+      "beat_count": 23,
+      "angle_summary": {
+        "left_elbow": 118.46161775596097,
+        "right_elbow": 122.77522161623884,
+        "left_knee": 123.88145914833035,
+        "right_knee": 136.02226578864358,
+        "left_shoulder": 43.51501304861784,
+        "right_shoulder": 47.69272086686386,
+        "hip_tilt": 34.39604819632437
+      }
+    },
+    {
+      "segment_id": 14,
+      "start_frame": 1693,
+      "end_frame": 1955,
+      "start_time_ms": 169300.0,
+      "end_time_ms": 195500.0,
+      "beat_count": 49,
+      "angle_summary": {
+        "left_elbow": 116.55874231616627,
+        "right_elbow": 115.74788299336386,
+        "left_knee": 128.03201267202863,
+        "right_knee": 138.5100341488002,
+        "left_shoulder": 54.17490870490607,
+        "right_shoulder": 61.475403426855706,
+        "hip_tilt": 6.035950111539769
+      }
+    },
+    {
+      "segment_id": 15,
+      "start_frame": 1955,
+      "end_frame": 2080,
+      "start_time_ms": 195500.0,
+      "end_time_ms": 208000.0,
+      "beat_count": 24,
+      "angle_summary": {
+        "left_elbow": 110.8654454643379,
+        "right_elbow": 106.21871203322938,
+        "left_knee": 118.26988689253989,
+        "right_knee": 127.68615164565371,
+        "left_shoulder": 63.19559147524652,
+        "right_shoulder": 65.28796898048758,
+        "hip_tilt": 19.87572918887154
+      }
+    },
+    {
+      "segment_id": 16,
+      "start_frame": 2080,
+      "end_frame": 2281,
+      "start_time_ms": 208000.0,
+      "end_time_ms": 228100.0,
+      "beat_count": 37,
+      "angle_summary": {
+        "left_elbow": 99.81033922311246,
+        "right_elbow": 110.26882598264245,
+        "left_knee": 102.26922558452938,
+        "right_knee": 112.06308885927889,
+        "left_shoulder": 67.07398740753531,
+        "right_shoulder": 82.574162413304,
+        "hip_tilt": 12.01721249124522
+      }
+    },
+    {
+      "segment_id": 17,
+      "start_frame": 2281,
+      "end_frame": 2385,
+      "start_time_ms": 228100.0,
+      "end_time_ms": 238500.0,
+      "beat_count": 20,
+      "angle_summary": {
+        "left_elbow": 117.04797224847711,
+        "right_elbow": 109.61217028216588,
+        "left_knee": 128.1645614064262,
+        "right_knee": 126.66299667231293,
+        "left_shoulder": 45.28215747772147,
+        "right_shoulder": 70.95709060847182,
+        "hip_tilt": 4.128030114190936
+      }
+    },
+    {
+      "segment_id": 18,
+      "start_frame": 2385,
+      "end_frame": 2511,
+      "start_time_ms": 238500.0,
+      "end_time_ms": 251100.0,
+      "beat_count": 23,
+      "angle_summary": {
+        "left_elbow": 96.67617255788029,
+        "right_elbow": 126.51329070707996,
+        "left_knee": 121.77820475659892,
+        "right_knee": 138.54006808576733,
+        "left_shoulder": 62.371594778895215,
+        "right_shoulder": 78.3331631265561,
+        "hip_tilt": 6.769820092553279
+      }
+    },
+    {
+      "segment_id": 19,
+      "start_frame": 2511,
+      "end_frame": 2607,
+      "start_time_ms": 251100.0,
+      "end_time_ms": 260700.0,
+      "beat_count": 17,
+      "angle_summary": {
+        "left_elbow": 99.01108015059219,
+        "right_elbow": 102.81439986243277,
+        "left_knee": 129.42023610062827,
+        "right_knee": 134.00570483939296,
+        "left_shoulder": 59.54250288201323,
+        "right_shoulder": 65.9368260210558,
+        "hip_tilt": 2.511794326306925
+      }
+    },
+    {
+      "segment_id": 20,
+      "start_frame": 2607,
+      "end_frame": 2708,
+      "start_time_ms": 260700.0,
+      "end_time_ms": 270800.0,
+      "beat_count": 20,
+      "angle_summary": {
+        "left_elbow": 101.78035260974505,
+        "right_elbow": 106.799392817474,
+        "left_knee": 118.36498255226874,
+        "right_knee": 126.33677884475388,
+        "left_shoulder": 59.76108762388997,
+        "right_shoulder": 73.94300507957954,
+        "hip_tilt": 6.800607874153943
+      }
+    }
+  ]
+}

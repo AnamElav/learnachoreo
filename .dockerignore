@@ -1,0 +1,28 @@
+# Large/local data (not needed in image)
+data/
+**/reports/
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+*.egg
+
+# Git and IDE
+.git/
+.gitignore
+.cursor/
+
+# Misc
+.DS_Store
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/

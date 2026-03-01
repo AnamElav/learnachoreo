@@ -1,0 +1,41 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  api:
+    build:
+      context: ..
+      dockerfile: choreo-ai-api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      OUTPUTS_DIR: /data/outputs
+      DATA_DIR: /data/pipeline
+    volumes:
+      - pipeline_and_outputs:/data
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: ..
+      dockerfile: choreo-ai-api/Dockerfile
+    command: celery -A app.celery_app worker --loglevel=info
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      OUTPUTS_DIR: /data/outputs
+      DATA_DIR: /data/pipeline
+    volumes:
+      - pipeline_and_outputs:/data
+    depends_on:
+      - redis
+      - api
+
+volumes:
+  redis_data:
+  pipeline_and_outputs:
