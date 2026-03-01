@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app.config import REDIS_URL, OUTPUTS_DIR
+from app.config import REDIS_URL, OUTPUTS_DIR, SKELETONS_DIR
 from app.tasks import process_video, set_job_status, JOB_KEY_PREFIX
 
 app = FastAPI(title="Choreo AI API", version="0.1.0")
@@ -80,3 +80,17 @@ def get_status(job_id: str):
         else:
             out["error"] = "choreo_data.json not found"
     return out
+
+
+@app.get("/skeleton/{video_id}")
+def get_skeleton(video_id: str):
+    """Return per-frame skeleton landmarks for the video. Used for overlay sync."""
+    if not video_id or "/" in video_id or ".." in video_id:
+        raise HTTPException(status_code=400, detail="Invalid video_id")
+    path = SKELETONS_DIR / f"{video_id}.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Skeleton not found")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

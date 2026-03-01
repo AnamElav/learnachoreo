@@ -7,3 +7,4 @@ OUTPUTS_DIR: Path = Path(os.environ.get("OUTPUTS_DIR", "/data/outputs")).resolve
 
 # Pipeline runs from repo root and uses DATA_DIR for raw/skeletons/choreo_data
 DATA_DIR: str = os.environ.get("DATA_DIR", "/data/pipeline")
+SKELETONS_DIR: Path = Path(DATA_DIR) / "skeletons"

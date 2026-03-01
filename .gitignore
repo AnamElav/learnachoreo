@@ -16,6 +16,6 @@ build/
 *.swo
 .DS_Store
 
-# Data / outputs (optional; uncomment if you don't want to track)
-# data/
-# output/
+# Data / outputs (large files; exclude to keep repo small)
+data/
+output/

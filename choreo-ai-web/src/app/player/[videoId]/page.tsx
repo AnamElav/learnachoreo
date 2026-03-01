@@ -6,17 +6,77 @@ import YouTube, { YouTubePlayer } from "react-youtube";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+interface Landmark {
+  name: string;
+  x: number;
+  y: number;
+  z?: number;
+  visibility?: number;
+}
+
+interface SkeletonFrame {
+  frame_number?: number;
+  timestamp_ms?: number;
+  landmarks?: Landmark[];
+}
+
 interface Segment {
   segment_id: number;
+  start_frame?: number;
+  end_frame?: number;
   start_time_ms: number;
   end_time_ms: number;
   beat_count: number;
+  angle_summary?: AngleSummary;
 }
 
 interface ChoreoData {
   video_id?: string;
   quality_assessment?: { overall_score?: number };
   segments?: Segment[];
+}
+
+/** Key joints for stick figure (excludes face/ear landmarks to avoid overlapping head circles). */
+const POSE_JOINTS = new Set([
+  "NOSE",
+  "LEFT_SHOULDER",
+  "RIGHT_SHOULDER",
+  "LEFT_ELBOW",
+  "RIGHT_ELBOW",
+  "LEFT_WRIST",
+  "RIGHT_WRIST",
+  "LEFT_HIP",
+  "RIGHT_HIP",
+  "LEFT_KNEE",
+  "RIGHT_KNEE",
+  "LEFT_ANKLE",
+  "RIGHT_ANKLE",
+]);
+
+/** MediaPipe pose edges for stick figure (landmark names). */
+const POSE_EDGES: [string, string][] = [
+  ["NOSE", "LEFT_SHOULDER"],
+  ["NOSE", "RIGHT_SHOULDER"],
+  ["LEFT_SHOULDER", "RIGHT_SHOULDER"],
+  ["LEFT_SHOULDER", "LEFT_ELBOW"],
+  ["LEFT_ELBOW", "LEFT_WRIST"],
+  ["RIGHT_SHOULDER", "RIGHT_ELBOW"],
+  ["RIGHT_ELBOW", "RIGHT_WRIST"],
+  ["LEFT_SHOULDER", "LEFT_HIP"],
+  ["RIGHT_SHOULDER", "RIGHT_HIP"],
+  ["LEFT_HIP", "RIGHT_HIP"],
+  ["LEFT_HIP", "LEFT_KNEE"],
+  ["LEFT_KNEE", "LEFT_ANKLE"],
+  ["RIGHT_HIP", "RIGHT_KNEE"],
+  ["RIGHT_KNEE", "RIGHT_ANKLE"],
+];
+
+function landmarkMap(landmarks: Landmark[]): Record<string, { x: number; y: number }> {
+  const m: Record<string, { x: number; y: number }> = {};
+  for (const lm of landmarks) {
+    m[lm.name] = { x: lm.x, y: lm.y };
+  }
+  return m;
 }
 
 function msToTimestamp(ms: number): string {
@@ -64,9 +124,14 @@ export default function PlayerPage() {
   const [error, setError] = useState<string | null>(null);
   const [playbackRate, setPlaybackRate] = useState<1 | 0.75 | 0.5>(1);
   const [activeSegmentId, setActiveSegmentId] = useState<number | null>(null);
+  const [showSkeleton, setShowSkeleton] = useState(false);
+  const [skeletonFrames, setSkeletonFrames] = useState<SkeletonFrame[]>([]);
+  const [skeletonLoading, setSkeletonLoading] = useState(false);
 
   const playerRef = useRef<YouTubePlayer | null>(null);
   const loopIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const videoContainerRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const segments = choreoData?.segments ?? [];
   const overallScore = choreoData?.quality_assessment?.overall_score ?? 0;
@@ -103,6 +168,32 @@ export default function PlayerPage() {
     };
   }, [jobId, videoId]);
 
+  // Fetch skeleton when user enables overlay
+  useEffect(() => {
+    if (!showSkeleton || !videoId || skeletonFrames.length > 0) return;
+    setSkeletonLoading(true);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_URL}/skeleton/${videoId}`);
+        if (!res.ok) {
+          if (!cancelled) setSkeletonLoading(false);
+          return;
+        }
+        const data: SkeletonFrame[] = await res.json();
+        if (!cancelled) {
+          setSkeletonFrames(Array.isArray(data) ? data : []);
+          setSkeletonLoading(false);
+        }
+      } catch {
+        if (!cancelled) setSkeletonLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [showSkeleton, videoId, skeletonFrames.length]);
+
   const stopLoop = useCallback(() => {
     if (loopIntervalRef.current) {
       clearInterval(loopIntervalRef.current);
@@ -138,6 +229,114 @@ export default function PlayerPage() {
       if (loopIntervalRef.current) clearInterval(loopIntervalRef.current);
     };
   }, []);
+
+  // Draw skeleton overlay synced to video time
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const container = videoContainerRef.current;
+    if (!canvas || !container || !showSkeleton || skeletonFrames.length === 0) return;
+
+    let rafId: number;
+
+    const draw = () => {
+      const rect = container.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      const player = playerRef.current;
+      const t = typeof player?.getCurrentTime === "function" ? player.getCurrentTime() : 0;
+      const timeMs = (typeof t === "number" ? t : 0) * 1000;
+
+      let best = 0;
+      let bestDiff = Math.abs((skeletonFrames[0]?.timestamp_ms ?? 0) - timeMs);
+      for (let i = 1; i < skeletonFrames.length; i++) {
+        const diff = Math.abs((skeletonFrames[i]?.timestamp_ms ?? 0) - timeMs);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          best = i;
+        }
+      }
+
+      const frame = skeletonFrames[best];
+      const landmarks = frame?.landmarks ?? [];
+      if (landmarks.length === 0) return;
+
+      const joints = landmarkMap(landmarks);
+      const pts = Object.entries(joints)
+        .filter(([name]) => POSE_JOINTS.has(name))
+        .map(([, p]) => p);
+
+      if (pts.length === 0) return;
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.scale(dpr, dpr);
+
+      // Normalized 0-1 coords → scale to fit. Video content often smaller than canvas (letterboxing/UI).
+      const VERTICAL_CONTENT_SCALE = 0.70;
+      const pad = 0.05;
+      const effWidth = rect.width * (1 - 2 * pad);
+      const effHeight = rect.height * (1 - 2 * pad) * VERTICAL_CONTENT_SCALE;
+      
+      let minX = pts[0].x, maxX = pts[0].x, minY = pts[0].y, maxY = pts[0].y;
+      for (const p of pts) {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+      }
+      const rangeX = Math.max(maxX - minX, 0.01);
+      const rangeY = Math.max(maxY - minY, 0.01);
+      const scale = Math.min(effWidth / rangeX, effHeight / rangeY);
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      const tx = rect.width / 2 - cx * scale;
+      const ty = rect.height / 2 - cy * scale;
+
+      const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+      const toCanvas = (p: { x: number; y: number }) => ({
+        x: clamp(p.x * scale + tx, 0, rect.width),
+        y: clamp(p.y * scale + ty, 0, rect.height),
+      });
+
+      ctx.strokeStyle = "#00FF88";
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+      for (const [a, b] of POSE_EDGES) {
+        const pa = joints[a];
+        const pb = joints[b];
+        if (!pa || !pb) continue;
+        const ca = toCanvas(pa);
+        const cb = toCanvas(pb);
+        ctx.beginPath();
+        ctx.moveTo(ca.x, ca.y);
+        ctx.lineTo(cb.x, cb.y);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = "#FFFFFF";
+      const jointRadius = 2;
+      for (const name of POSE_JOINTS) {
+        const p = joints[name];
+        if (!p) continue;
+        const c = toCanvas(p);
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, jointRadius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      rafId = requestAnimationFrame(draw);
+    };
+
+    draw();
+    return () => cancelAnimationFrame(rafId);
+  }, [showSkeleton, skeletonFrames]);
 
   const setRate = useCallback((rate: 1 | 0.75 | 0.5) => {
     setPlaybackRate(rate);
@@ -181,6 +380,18 @@ export default function PlayerPage() {
           ← Home
         </button>
         <div className="flex items-center gap-4">
+          <button
+            type="button"
+            onClick={() => setShowSkeleton((v) => !v)}
+            disabled={skeletonLoading}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+              showSkeleton
+                ? "bg-emerald-500/20 text-emerald-400"
+                : "bg-zinc-900 text-zinc-500 hover:text-zinc-300"
+            }`}
+          >
+            {skeletonLoading ? "Loading skeleton…" : "Show Reference Skeleton"}
+          </button>
           <QualityBadge score={overallScore} />
           <div className="flex items-center gap-1 rounded-lg bg-zinc-900 p-1">
             {([1, 0.75, 0.5] as const).map((rate) => (
@@ -202,27 +413,44 @@ export default function PlayerPage() {
       </header>
 
       <div className="flex flex-1 min-h-0">
-        {/* Video — fills entire left panel */}
-        <div className="flex-1 min-h-0 min-w-0 relative p-2 sm:p-4">
-          <div className="absolute inset-2 sm:inset-4 rounded-xl overflow-hidden bg-black">
-            <YouTube
-              videoId={videoId}
-              opts={{
-                width: "100%",
-                height: "100%",
-                playerVars: {
-                  autoplay: 0,
-                  modestbranding: 1,
-                },
-              }}
-              onReady={(e) => {
-                playerRef.current = e.target;
-                e.target.setPlaybackRate(playbackRate);
-              }}
-              onStateChange={(e) => {
-                if (e.data === 0) stopLoop();
-              }}
-            />
+        {/* Video — largest 16:9 box that fits, no cropping */}
+        <div className="flex-1 min-h-0 min-w-0 flex items-center justify-center p-2 sm:p-4">
+          <div className="w-full h-full flex items-center justify-center min-h-0 min-w-0">
+            <div
+              ref={videoContainerRef}
+              className="w-full h-full max-w-full max-h-full aspect-video rounded-xl overflow-hidden bg-black relative"
+            >
+              <div className="absolute inset-0">
+                <YouTube
+                  videoId={videoId}
+                  className="!w-full !h-full"
+                  iframeClassName="!w-full !h-full"
+                  style={{ width: "100%", height: "100%" }}
+                  opts={{
+                    width: "100%",
+                    height: "100%",
+                    playerVars: {
+                      autoplay: 0,
+                      modestbranding: 1,
+                    },
+                  }}
+                  onReady={(e) => {
+                    playerRef.current = e.target;
+                    e.target.setPlaybackRate(playbackRate);
+                  }}
+                  onStateChange={(e) => {
+                    if (e.data === 0) stopLoop();
+                  }}
+                />
+              </div>
+              {showSkeleton && (
+                <canvas
+                  ref={canvasRef}
+                  className="absolute inset-0 w-full h-full pointer-events-none rounded-xl"
+                  style={{ zIndex: 10 }}
+                />
+              )}
+            </div>
           </div>
         </div>
 
