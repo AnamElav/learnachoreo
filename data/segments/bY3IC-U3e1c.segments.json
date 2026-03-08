@@ -34,26 +34,26 @@
   {
     "segment_id": 4,
     "start_frame": 479,
-    "end_frame": 604,
+    "end_frame": 599,
     "start_time_ms": 47900.0,
-    "end_time_ms": 60400.0,
+    "end_time_ms": 59900.0,
     "beat_count": 22
   },
   {
     "segment_id": 5,
-    "start_frame": 604,
-    "end_frame": 730,
-    "start_time_ms": 60400.0,
-    "end_time_ms": 73000.0,
-    "beat_count": 24
+    "start_frame": 599,
+    "end_frame": 724,
+    "start_time_ms": 59900.0,
+    "end_time_ms": 72400.0,
+    "beat_count": 23
   },
   {
     "segment_id": 6,
-    "start_frame": 730,
+    "start_frame": 724,
     "end_frame": 855,
-    "start_time_ms": 73000.0,
+    "start_time_ms": 72400.0,
     "end_time_ms": 85500.0,
-    "beat_count": 23
+    "beat_count": 24
   },
   {
     "segment_id": 7,
@@ -66,105 +66,113 @@
   {
     "segment_id": 8,
     "start_frame": 975,
-    "end_frame": 1090,
+    "end_frame": 1095,
     "start_time_ms": 97500.0,
-    "end_time_ms": 109000.0,
-    "beat_count": 22
+    "end_time_ms": 109500.0,
+    "beat_count": 23
   },
   {
     "segment_id": 9,
-    "start_frame": 1090,
+    "start_frame": 1095,
     "end_frame": 1210,
-    "start_time_ms": 109000.0,
+    "start_time_ms": 109500.0,
     "end_time_ms": 121000.0,
-    "beat_count": 22
+    "beat_count": 21
   },
   {
     "segment_id": 10,
     "start_frame": 1210,
-    "end_frame": 1330,
+    "end_frame": 1313,
     "start_time_ms": 121000.0,
-    "end_time_ms": 133000.0,
-    "beat_count": 22
+    "end_time_ms": 131300.0,
+    "beat_count": 18
   },
   {
     "segment_id": 11,
-    "start_frame": 1330,
-    "end_frame": 1455,
-    "start_time_ms": 133000.0,
-    "end_time_ms": 145500.0,
-    "beat_count": 23
-  },
-  {
-    "segment_id": 12,
-    "start_frame": 1455,
-    "end_frame": 1575,
-    "start_time_ms": 145500.0,
-    "end_time_ms": 157500.0,
+    "start_frame": 1313,
+    "end_frame": 1428,
+    "start_time_ms": 131300.0,
+    "end_time_ms": 142800.0,
     "beat_count": 21
   },
   {
+    "segment_id": 12,
+    "start_frame": 1428,
+    "end_frame": 1543,
+    "start_time_ms": 142800.0,
+    "end_time_ms": 154300.0,
+    "beat_count": 22
+  },
+  {
     "segment_id": 13,
-    "start_frame": 1575,
-    "end_frame": 1693,
-    "start_time_ms": 157500.0,
-    "end_time_ms": 169300.0,
-    "beat_count": 23
+    "start_frame": 1543,
+    "end_frame": 1667,
+    "start_time_ms": 154300.0,
+    "end_time_ms": 166700.0,
+    "beat_count": 22
   },
   {
     "segment_id": 14,
-    "start_frame": 1693,
+    "start_frame": 1667,
     "end_frame": 1955,
-    "start_time_ms": 169300.0,
+    "start_time_ms": 166700.0,
     "end_time_ms": 195500.0,
-    "beat_count": 49
+    "beat_count": 55
   },
   {
     "segment_id": 15,
     "start_frame": 1955,
-    "end_frame": 2080,
+    "end_frame": 2059,
     "start_time_ms": 195500.0,
-    "end_time_ms": 208000.0,
-    "beat_count": 24
+    "end_time_ms": 205900.0,
+    "beat_count": 19
   },
   {
     "segment_id": 16,
-    "start_frame": 2080,
-    "end_frame": 2281,
-    "start_time_ms": 208000.0,
-    "end_time_ms": 228100.0,
-    "beat_count": 37
-  },
-  {
-    "segment_id": 17,
-    "start_frame": 2281,
-    "end_frame": 2385,
-    "start_time_ms": 228100.0,
-    "end_time_ms": 238500.0,
-    "beat_count": 20
-  },
-  {
-    "segment_id": 18,
-    "start_frame": 2385,
-    "end_frame": 2511,
-    "start_time_ms": 238500.0,
-    "end_time_ms": 251100.0,
-    "beat_count": 23
-  },
-  {
-    "segment_id": 19,
-    "start_frame": 2511,
-    "end_frame": 2607,
-    "start_time_ms": 251100.0,
-    "end_time_ms": 260700.0,
+    "start_frame": 2059,
+    "end_frame": 2149,
+    "start_time_ms": 205900.0,
+    "end_time_ms": 214900.0,
     "beat_count": 17
   },
   {
+    "segment_id": 17,
+    "start_frame": 2149,
+    "end_frame": 2275,
+    "start_time_ms": 214900.0,
+    "end_time_ms": 227500.0,
+    "beat_count": 23
+  },
+  {
+    "segment_id": 18,
+    "start_frame": 2275,
+    "end_frame": 2385,
+    "start_time_ms": 227500.0,
+    "end_time_ms": 238500.0,
+    "beat_count": 22
+  },
+  {
+    "segment_id": 19,
+    "start_frame": 2385,
+    "end_frame": 2506,
+    "start_time_ms": 238500.0,
+    "end_time_ms": 250600.0,
+    "beat_count": 22
+  },
+  {
     "segment_id": 20,
+    "start_frame": 2506,
+    "end_frame": 2607,
+    "start_time_ms": 250600.0,
+    "end_time_ms": 260700.0,
+    "beat_count": 18
+  },
+  {
+    "segment_id": 21,
     "start_frame": 2607,
-    "end_frame": 2708,
+    "end_frame": 2709,
     "start_time_ms": 260700.0,
-    "end_time_ms": 270800.0,
+    "end_time_ms": 270900.0,
     "beat_count": 20
   }
 ]

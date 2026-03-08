@@ -1,11 +1,13 @@
-"""FastAPI app: POST /process, GET /status/{job_id}."""
+"""FastAPI app: POST /process, GET /status/{job_id}, GET /video/{job_id}."""
 import json
+import os
 import re
 import uuid
 
 import redis
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.config import REDIS_URL, OUTPUTS_DIR, SKELETONS_DIR
@@ -94,3 +96,75 @@ def get_skeleton(video_id: str):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/video/{job_id}")
+def get_video(job_id: str, request: Request):
+    """Stream the video file for a job with HTTP range request support for seeking."""
+    if not job_id or "/" in job_id or ".." in job_id:
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+
+    video_path = OUTPUTS_DIR / job_id / "video.mp4"
+    if not video_path.is_file():
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    file_size = video_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    if range_header:
+        # Parse range header: "bytes=start-end"
+        range_match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if not range_match:
+            raise HTTPException(status_code=416, detail="Invalid range header")
+
+        start = int(range_match.group(1))
+        end_str = range_match.group(2)
+        end = int(end_str) if end_str else file_size - 1
+
+        if start >= file_size or end >= file_size or start > end:
+            raise HTTPException(status_code=416, detail="Range not satisfiable")
+
+        content_length = end - start + 1
+
+        def iter_file_range():
+            with open(video_path, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                chunk_size = 64 * 1024  # 64KB chunks
+                while remaining > 0:
+                    read_size = min(chunk_size, remaining)
+                    data = f.read(read_size)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            iter_file_range(),
+            status_code=206,
+            media_type="video/mp4",
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+            },
+        )
+    else:
+        # No range header, return full file
+        def iter_file():
+            with open(video_path, "rb") as f:
+                chunk_size = 64 * 1024
+                while True:
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    yield data
+
+        return StreamingResponse(
+            iter_file(),
+            media_type="video/mp4",
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+            },
+        )

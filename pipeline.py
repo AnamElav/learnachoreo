@@ -83,9 +83,14 @@ def _summarize_segment_angles(
     return summary
 
 
-def run_pipeline(source_url: str) -> Path:
+def run_pipeline(source_url: str, output_dir: Path | None = None) -> Path:
     """
     Run the full pipeline for a single YouTube URL.
+
+    Args:
+        source_url: YouTube video URL.
+        output_dir: Optional directory to write choreo_data.json and video.mp4.
+                    If provided, the video file is moved here instead of deleted.
 
     Returns:
         Path to the written choreo_data JSON file.
@@ -179,17 +184,36 @@ def run_pipeline(source_url: str) -> Path:
         "segments": segments_with_angles,
     }
 
-    output_dir = get_data_dir() / "choreo_data"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    choreo_path = output_dir / f"{video_id}.choreo_data.json"
+    # Determine output location
+    if output_dir:
+        final_output_dir = Path(output_dir)
+    else:
+        final_output_dir = get_data_dir() / "choreo_data"
+    final_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write choreo_data.json
+    if output_dir:
+        choreo_path = final_output_dir / "choreo_data.json"
+    else:
+        choreo_path = final_output_dir / f"{video_id}.choreo_data.json"
     choreo_path.write_text(json.dumps(choreo_data, ensure_ascii=False, indent=2), encoding="utf-8")
     stage_times.append(("Build choreo_data", time.perf_counter() - t0))
     print(f"       Stage took: {stage_times[-1][1]:.1f}s")
 
-    # Cleanup: delete raw video to free space; keep only derived JSONs
-    print("[7/7] Cleanup: removing raw video file...")
+    # Step 7: Move or delete video file
+    print("[7/7] Handling video file...")
     t0 = time.perf_counter()
-    if video_path.is_file():
+    if output_dir and video_path.is_file():
+        # Move video to output directory
+        import shutil
+        dest_video = final_output_dir / "video.mp4"
+        try:
+            shutil.move(str(video_path), str(dest_video))
+            print(f"       Moved video to: {dest_video}")
+        except OSError as e:
+            print(f"       Warning: could not move video: {e}", file=sys.stderr)
+    elif video_path.is_file():
+        # No output_dir specified, delete video to save space (original behavior)
         try:
             video_path.unlink()
             print(f"       Deleted: {video_path}")
@@ -197,7 +221,7 @@ def run_pipeline(source_url: str) -> Path:
             print(f"       Warning: could not delete raw video: {e}", file=sys.stderr)
     else:
         print(f"       (raw video already absent)")
-    stage_times.append(("Cleanup", time.perf_counter() - t0))
+    stage_times.append(("Handle video", time.perf_counter() - t0))
     print(f"       Stage took: {stage_times[-1][1]:.1f}s")
 
     # Final summary

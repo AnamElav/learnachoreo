@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
-import YouTube, { YouTubePlayer } from "react-youtube";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -128,7 +127,7 @@ export default function PlayerPage() {
   const [skeletonFrames, setSkeletonFrames] = useState<SkeletonFrame[]>([]);
   const [skeletonLoading, setSkeletonLoading] = useState(false);
 
-  const playerRef = useRef<YouTubePlayer | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const loopIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -204,20 +203,19 @@ export default function PlayerPage() {
 
   const playSegment = useCallback(
     (seg: Segment) => {
-      const player = playerRef.current;
-      if (!player?.seekTo) return;
+      const video = videoRef.current;
+      if (!video) return;
 
       const startSec = seg.start_time_ms / 1000;
       const endSec = seg.end_time_ms / 1000;
-      player.seekTo(startSec, true);
-      player.playVideo();
+      video.currentTime = startSec;
+      video.play();
       setActiveSegmentId(seg.segment_id);
 
       if (loopIntervalRef.current) clearInterval(loopIntervalRef.current);
       loopIntervalRef.current = setInterval(() => {
-        const t = player.getCurrentTime?.();
-        if (typeof t === "number" && t >= endSec - 0.1) {
-          player.seekTo(startSec, true);
+        if (video.currentTime >= endSec - 0.1) {
+          video.currentTime = startSec;
         }
       }, 200);
     },
@@ -249,9 +247,8 @@ export default function PlayerPage() {
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      const player = playerRef.current;
-      const t = typeof player?.getCurrentTime === "function" ? player.getCurrentTime() : 0;
-      const timeMs = (typeof t === "number" ? t : 0) * 1000;
+      const video = videoRef.current;
+      const timeMs = (video?.currentTime ?? 0) * 1000;
 
       let best = 0;
       let bestDiff = Math.abs((skeletonFrames[0]?.timestamp_ms ?? 0) - timeMs);
@@ -340,8 +337,8 @@ export default function PlayerPage() {
 
   const setRate = useCallback((rate: 1 | 0.75 | 0.5) => {
     setPlaybackRate(rate);
-    if (playerRef.current?.setPlaybackRate) {
-      playerRef.current.setPlaybackRate(rate);
+    if (videoRef.current) {
+      videoRef.current.playbackRate = rate;
     }
   }, []);
 
@@ -420,35 +417,31 @@ export default function PlayerPage() {
               ref={videoContainerRef}
               className="w-full h-full max-w-full max-h-full aspect-video rounded-xl overflow-hidden bg-black relative"
             >
-              <div className="absolute inset-0">
-                <YouTube
-                  videoId={videoId}
-                  className="!w-full !h-full"
-                  iframeClassName="!w-full !h-full"
-                  style={{ width: "100%", height: "100%" }}
-                  opts={{
-                    width: "100%",
-                    height: "100%",
-                    playerVars: {
-                      autoplay: 0,
-                      modestbranding: 1,
-                    },
-                  }}
-                  onReady={(e) => {
-                    playerRef.current = e.target;
-                    e.target.setPlaybackRate(playbackRate);
-                  }}
-                  onStateChange={(e) => {
-                    if (e.data === 0) stopLoop();
-                  }}
-                />
-              </div>
+              <video
+                ref={videoRef}
+                src={`${API_URL}/video/${jobId}`}
+                className="absolute inset-0 w-full h-full object-contain"
+                controls
+                playsInline
+                onLoadedMetadata={() => {
+                  if (videoRef.current) {
+                    videoRef.current.playbackRate = playbackRate;
+                  }
+                }}
+                onEnded={stopLoop}
+              />
               {showSkeleton && (
-                <canvas
-                  ref={canvasRef}
-                  className="absolute inset-0 w-full h-full pointer-events-none rounded-xl"
-                  style={{ zIndex: 10 }}
-                />
+                <>
+                  <div
+                    className="absolute inset-0 w-full h-full pointer-events-none rounded-xl bg-black/40"
+                    style={{ zIndex: 5 }}
+                  />
+                  <canvas
+                    ref={canvasRef}
+                    className="absolute inset-0 w-full h-full pointer-events-none rounded-xl"
+                    style={{ zIndex: 10 }}
+                  />
+                </>
               )}
             </div>
           </div>

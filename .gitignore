@@ -19,3 +19,19 @@ build/
 # Data / outputs (large files; exclude to keep repo small)
 data/
 output/
+outputs/
+*.mp4
+*.webm
+*.mkv
+*.avi
+
+# Node
+node_modules/
+.next/
+.turbo/
+
+# Logs & runtime files
+*.log
+npm-debug.log*
+celerybeat-schedule
+*.pid
