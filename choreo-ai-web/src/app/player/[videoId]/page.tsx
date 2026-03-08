@@ -232,7 +232,8 @@ export default function PlayerPage() {
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = videoContainerRef.current;
-    if (!canvas || !container || !showSkeleton || skeletonFrames.length === 0) return;
+    const video = videoRef.current;
+    if (!canvas || !container || !video || !showSkeleton || skeletonFrames.length === 0) return;
 
     let rafId: number;
 
@@ -247,8 +248,7 @@ export default function PlayerPage() {
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      const video = videoRef.current;
-      const timeMs = (video?.currentTime ?? 0) * 1000;
+      const timeMs = (video.currentTime ?? 0) * 1000;
 
       let best = 0;
       let bestDiff = Math.abs((skeletonFrames[0]?.timestamp_ms ?? 0) - timeMs);
@@ -262,44 +262,40 @@ export default function PlayerPage() {
 
       const frame = skeletonFrames[best];
       const landmarks = frame?.landmarks ?? [];
-      if (landmarks.length === 0) return;
+      if (landmarks.length === 0) {
+        rafId = requestAnimationFrame(draw);
+        return;
+      }
 
       const joints = landmarkMap(landmarks);
-      const pts = Object.entries(joints)
-        .filter(([name]) => POSE_JOINTS.has(name))
-        .map(([, p]) => p);
-
-      if (pts.length === 0) return;
 
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.scale(dpr, dpr);
 
-      // Normalized 0-1 coords → scale to fit. Video content often smaller than canvas (letterboxing/UI).
-      const VERTICAL_CONTENT_SCALE = 0.70;
-      const pad = 0.05;
-      const effWidth = rect.width * (1 - 2 * pad);
-      const effHeight = rect.height * (1 - 2 * pad) * VERTICAL_CONTENT_SCALE;
-      
-      let minX = pts[0].x, maxX = pts[0].x, minY = pts[0].y, maxY = pts[0].y;
-      for (const p of pts) {
-        minX = Math.min(minX, p.x);
-        maxX = Math.max(maxX, p.x);
-        minY = Math.min(minY, p.y);
-        maxY = Math.max(maxY, p.y);
-      }
-      const rangeX = Math.max(maxX - minX, 0.01);
-      const rangeY = Math.max(maxY - minY, 0.01);
-      const scale = Math.min(effWidth / rangeX, effHeight / rangeY);
-      const cx = (minX + maxX) / 2;
-      const cy = (minY + maxY) / 2;
-      const tx = rect.width / 2 - cx * scale;
-      const ty = rect.height / 2 - cy * scale;
+      // Calculate letterboxing offset: video content may not fill the entire element
+      const videoWidth = video.videoWidth || 1;
+      const videoHeight = video.videoHeight || 1;
+      const containerWidth = rect.width;
+      const containerHeight = rect.height;
 
-      const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+      // object-fit: contain uses the smaller scale to fit the video
+      const scaleX = containerWidth / videoWidth;
+      const scaleY = containerHeight / videoHeight;
+      const scale = Math.min(scaleX, scaleY);
+
+      // Actual rendered video size
+      const renderedWidth = videoWidth * scale;
+      const renderedHeight = videoHeight * scale;
+
+      // Offset to center the video content (letterboxing)
+      const offsetX = (containerWidth - renderedWidth) / 2;
+      const offsetY = (containerHeight - renderedHeight) / 2;
+
+      // Transform normalized 0-1 landmark coords to canvas coords
       const toCanvas = (p: { x: number; y: number }) => ({
-        x: clamp(p.x * scale + tx, 0, rect.width),
-        y: clamp(p.y * scale + ty, 0, rect.height),
+        x: offsetX + p.x * renderedWidth,
+        y: offsetY + p.y * renderedHeight,
       });
 
       ctx.strokeStyle = "#00FF88";
@@ -318,7 +314,7 @@ export default function PlayerPage() {
       }
 
       ctx.fillStyle = "#FFFFFF";
-      const jointRadius = 2;
+      const jointRadius = 4;
       for (const name of POSE_JOINTS) {
         const p = joints[name];
         if (!p) continue;
