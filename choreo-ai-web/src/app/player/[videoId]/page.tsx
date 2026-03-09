@@ -26,7 +26,7 @@ interface Segment {
   start_time_ms: number;
   end_time_ms: number;
   beat_count: number;
-  angle_summary?: AngleSummary;
+  angle_summary?: Record<string, number>;
 }
 
 interface ChoreoData {
@@ -70,12 +70,147 @@ const POSE_EDGES: [string, string][] = [
   ["RIGHT_KNEE", "RIGHT_ANKLE"],
 ];
 
+/** MoveNet keypoint indices to names (17 keypoints) */
+const MOVENET_KEYPOINTS = [
+  "NOSE",
+  "LEFT_EYE",
+  "RIGHT_EYE",
+  "LEFT_EAR",
+  "RIGHT_EAR",
+  "LEFT_SHOULDER",
+  "RIGHT_SHOULDER",
+  "LEFT_ELBOW",
+  "RIGHT_ELBOW",
+  "LEFT_WRIST",
+  "RIGHT_WRIST",
+  "LEFT_HIP",
+  "RIGHT_HIP",
+  "LEFT_KNEE",
+  "RIGHT_KNEE",
+  "LEFT_ANKLE",
+  "RIGHT_ANKLE",
+];
+
 function landmarkMap(landmarks: Landmark[]): Record<string, { x: number; y: number }> {
   const m: Record<string, { x: number; y: number }> = {};
   for (const lm of landmarks) {
     m[lm.name] = { x: lm.x, y: lm.y };
   }
   return m;
+}
+
+/** Calculate angle at point B given three points A, B, C (in degrees) */
+function calculateAngle(
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  c: { x: number; y: number }
+): number {
+  const ab = { x: a.x - b.x, y: a.y - b.y };
+  const cb = { x: c.x - b.x, y: c.y - b.y };
+  
+  const dot = ab.x * cb.x + ab.y * cb.y;
+  const magAB = Math.sqrt(ab.x * ab.x + ab.y * ab.y);
+  const magCB = Math.sqrt(cb.x * cb.x + cb.y * cb.y);
+  
+  if (magAB === 0 || magCB === 0) return 0;
+  
+  const cosAngle = Math.max(-1, Math.min(1, dot / (magAB * magCB)));
+  return Math.acos(cosAngle) * (180 / Math.PI);
+}
+
+/** Joint angle definitions: [jointName, pointA, pointB (vertex), pointC] */
+const JOINT_ANGLES: { name: string; label: string; points: [string, string, string] }[] = [
+  { name: "LEFT_ELBOW", label: "left elbow", points: ["LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"] },
+  { name: "RIGHT_ELBOW", label: "right elbow", points: ["RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"] },
+  { name: "LEFT_KNEE", label: "left knee", points: ["LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"] },
+  { name: "RIGHT_KNEE", label: "right knee", points: ["RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"] },
+  { name: "LEFT_SHOULDER", label: "left shoulder", points: ["LEFT_ELBOW", "LEFT_SHOULDER", "LEFT_HIP"] },
+  { name: "RIGHT_SHOULDER", label: "right shoulder", points: ["RIGHT_ELBOW", "RIGHT_SHOULDER", "RIGHT_HIP"] },
+];
+
+/** Calculate all joint angles from a set of keypoints */
+function calculateJointAngles(joints: Record<string, { x: number; y: number }>): Record<string, number> {
+  const angles: Record<string, number> = {};
+  
+  for (const { name, points } of JOINT_ANGLES) {
+    const [aName, bName, cName] = points;
+    const a = joints[aName];
+    const b = joints[bName];
+    const c = joints[cName];
+    
+    if (a && b && c) {
+      angles[name] = calculateAngle(a, b, c);
+    }
+  }
+  
+  return angles;
+}
+
+/** Calculate median of an array of numbers */
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** Get median angles from a buffer of angle records */
+function getMedianAngles(buffer: Record<string, number>[]): Record<string, number> {
+  if (buffer.length === 0) return {};
+  
+  const result: Record<string, number> = {};
+  
+  for (const { name } of JOINT_ANGLES) {
+    const values = buffer
+      .map(frame => frame[name])
+      .filter((v): v is number => v !== undefined);
+    
+    if (values.length >= 3) { // Require at least 3 samples for a stable median
+      result[name] = median(values);
+    }
+  }
+  
+  return result;
+}
+
+/** Compare two sets of joint angles and return score + worst joint */
+function comparePoses(
+  userAngles: Record<string, number>,
+  refAngles: Record<string, number>
+): { score: number; worstJoint: string | null; worstDiff: number; jointsCompared: number } {
+  const diffs: { name: string; label: string; diff: number }[] = [];
+
+  for (const { name, label } of JOINT_ANGLES) {
+    const userAngle = userAngles[name];
+    const refAngle = refAngles[name];
+
+    if (userAngle !== undefined && refAngle !== undefined) {
+      diffs.push({ name, label, diff: Math.abs(userAngle - refAngle) });
+    }
+  }
+
+  if (diffs.length === 0) {
+    return { score: -1, worstJoint: null, worstDiff: 0, jointsCompared: 0 };
+  }
+
+  // Make the score robust to a single outlier joint by using a trimmed mean:
+  // sort diffs and drop the single worst joint if we have at least 3.
+  const sortedDiffs = [...diffs].sort((a, b) => a.diff - b.diff);
+  const usedDiffs =
+    sortedDiffs.length >= 3 ? sortedDiffs.slice(0, sortedDiffs.length - 1) : sortedDiffs;
+
+  const avgDiff =
+    usedDiffs.reduce((sum, d) => sum + d.diff, 0) / usedDiffs.length;
+  const score = Math.max(0, Math.min(100, 100 - avgDiff));
+
+  const worst = diffs.reduce((max, d) => (d.diff > max.diff ? d : max), diffs[0]);
+
+  return {
+    score,
+    worstJoint: worst.diff > 15 ? worst.label : null,
+    worstDiff: worst.diff,
+    jointsCompared: usedDiffs.length,
+  };
 }
 
 function msToTimestamp(ms: number): string {
@@ -111,6 +246,41 @@ function QualityBadge({ score }: { score: number }) {
   );
 }
 
+/** Draw skeleton on canvas */
+function drawSkeleton(
+  ctx: CanvasRenderingContext2D,
+  joints: Record<string, { x: number; y: number }>,
+  toCanvas: (p: { x: number; y: number }) => { x: number; y: number },
+  strokeColor: string,
+  fillColor: string
+) {
+  ctx.strokeStyle = strokeColor;
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  for (const [a, b] of POSE_EDGES) {
+    const pa = joints[a];
+    const pb = joints[b];
+    if (!pa || !pb) continue;
+    const ca = toCanvas(pa);
+    const cb = toCanvas(pb);
+    ctx.beginPath();
+    ctx.moveTo(ca.x, ca.y);
+    ctx.lineTo(cb.x, cb.y);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = fillColor;
+  const jointRadius = 4;
+  for (const name of POSE_JOINTS) {
+    const p = joints[name];
+    if (!p) continue;
+    const c = toCanvas(p);
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, jointRadius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
 export default function PlayerPage() {
   const params = useParams();
   const searchParams = useSearchParams();
@@ -127,10 +297,43 @@ export default function PlayerPage() {
   const [skeletonFrames, setSkeletonFrames] = useState<SkeletonFrame[]>([]);
   const [skeletonLoading, setSkeletonLoading] = useState(false);
 
+  // Webcam state
+  const [practiceMode, setPracticeMode] = useState(false);
+  const [webcamLoading, setWebcamLoading] = useState(false);
+  const [webcamError, setWebcamError] = useState<string | null>(null);
+  const [detectorReady, setDetectorReady] = useState(false);
+  const [useTestVideo, setUseTestVideo] = useState(false); // Use reference video as input for testing
+
+  // Pose comparison state
+  const [poseScore, setPoseScore] = useState<number | null>(null);
+  const [worstJoint, setWorstJoint] = useState<string | null>(null);
+  const [displayedScore, setDisplayedScore] = useState<number | null>(null); // Smoothed score (internal only)
+
+  // Coaching state
+  const [coachingNote, setCoachingNote] = useState<string | null>(null);
+  const [coachingLoading, setCoachingLoading] = useState(false);
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const loopIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Webcam refs
+  const webcamRef = useRef<HTMLVideoElement | null>(null);
+  const webcamCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const webcamContainerRef = useRef<HTMLDivElement | null>(null);
+  const webcamStreamRef = useRef<MediaStream | null>(null);
+  const detectorRef = useRef<unknown>(null);
+  const webcamRafRef = useRef<number | null>(null);
+  const latestUserJointsRef = useRef<Record<string, { x: number; y: number }> | null>(null);
+  
+  // Rolling buffer for pose smoothing (stores joint angles, not raw keypoints)
+  const jointAnglesBufferRef = useRef<Record<string, number>[]>([]);
+  const BUFFER_SIZE = 30;
+
+  // Coaching timing/throttling
+  const segmentSecondsRef = useRef<number>(0);
+  const lastCoachingTimeRef = useRef<number>(0);
 
   const segments = choreoData?.segments ?? [];
   const overallScore = choreoData?.quality_assessment?.overall_score ?? 0;
@@ -228,7 +431,7 @@ export default function PlayerPage() {
     };
   }, []);
 
-  // Draw skeleton overlay synced to video time
+  // Draw reference skeleton overlay synced to video time
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = videoContainerRef.current;
@@ -273,56 +476,27 @@ export default function PlayerPage() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.scale(dpr, dpr);
 
-      // Calculate letterboxing offset: video content may not fill the entire element
       const videoWidth = video.videoWidth || 1;
       const videoHeight = video.videoHeight || 1;
       const containerWidth = rect.width;
       const containerHeight = rect.height;
 
-      // object-fit: contain uses the smaller scale to fit the video
       const scaleX = containerWidth / videoWidth;
       const scaleY = containerHeight / videoHeight;
       const scale = Math.min(scaleX, scaleY);
 
-      // Actual rendered video size
       const renderedWidth = videoWidth * scale;
       const renderedHeight = videoHeight * scale;
 
-      // Offset to center the video content (letterboxing)
       const offsetX = (containerWidth - renderedWidth) / 2;
       const offsetY = (containerHeight - renderedHeight) / 2;
 
-      // Transform normalized 0-1 landmark coords to canvas coords
       const toCanvas = (p: { x: number; y: number }) => ({
         x: offsetX + p.x * renderedWidth,
         y: offsetY + p.y * renderedHeight,
       });
 
-      ctx.strokeStyle = "#00FF88";
-      ctx.lineWidth = 2;
-      ctx.lineCap = "round";
-      for (const [a, b] of POSE_EDGES) {
-        const pa = joints[a];
-        const pb = joints[b];
-        if (!pa || !pb) continue;
-        const ca = toCanvas(pa);
-        const cb = toCanvas(pb);
-        ctx.beginPath();
-        ctx.moveTo(ca.x, ca.y);
-        ctx.lineTo(cb.x, cb.y);
-        ctx.stroke();
-      }
-
-      ctx.fillStyle = "#FFFFFF";
-      const jointRadius = 4;
-      for (const name of POSE_JOINTS) {
-        const p = joints[name];
-        if (!p) continue;
-        const c = toCanvas(p);
-        ctx.beginPath();
-        ctx.arc(c.x, c.y, jointRadius, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      drawSkeleton(ctx, joints, toCanvas, "#00FF88", "#FFFFFF");
 
       rafId = requestAnimationFrame(draw);
     };
@@ -330,6 +504,510 @@ export default function PlayerPage() {
     draw();
     return () => cancelAnimationFrame(rafId);
   }, [showSkeleton, skeletonFrames]);
+
+  // Start practice mode: init webcam (or test video) and MoveNet
+  const startPractice = useCallback(async (testMode = false) => {
+    if (practiceMode) return;
+    
+    setWebcamLoading(true);
+    setWebcamError(null);
+    setUseTestVideo(testMode);
+
+    try {
+      if (!testMode) {
+        // Request webcam access
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: "user" },
+          audio: false,
+        });
+        
+        webcamStreamRef.current = stream;
+      }
+
+      // Load TensorFlow.js and MoveNet model
+      const tf = await import("@tensorflow/tfjs");
+      await tf.ready();
+      // Load MoveNet SinglePose Lightning model from local files (avoids CORS issues)
+      const model = await tf.loadGraphModel("/models/movenet/model.json");
+      
+      detectorRef.current = model;
+      
+      // Set practice mode first so the video element renders
+      setPracticeMode(true);
+      
+    } catch (err) {
+      setWebcamError(err instanceof Error ? err.message : "Failed to access webcam");
+      // Cleanup on error
+      if (webcamStreamRef.current) {
+        webcamStreamRef.current.getTracks().forEach((t) => t.stop());
+        webcamStreamRef.current = null;
+      }
+    } finally {
+      setWebcamLoading(false);
+    }
+  }, [practiceMode]);
+  
+  // Effect to connect stream to video element once it's rendered (webcam mode only)
+  useEffect(() => {
+    if (!practiceMode || useTestVideo || !webcamRef.current || !webcamStreamRef.current) return;
+    
+    const video = webcamRef.current;
+    const stream = webcamStreamRef.current;
+    video.srcObject = stream;
+    
+    video.play()
+      .then(() => {
+        setDetectorReady(true);
+      })
+      .catch(() => {
+        // ignore autoplay errors
+      });
+      
+  }, [practiceMode, useTestVideo]);
+
+  // In test mode, just mark detector as ready (we'll read from reference video directly)
+  useEffect(() => {
+    if (!practiceMode || !useTestVideo) return;
+    setDetectorReady(true);
+  }, [practiceMode, useTestVideo]);
+
+  // Stop practice mode
+  const stopPractice = useCallback(() => {
+    if (webcamRafRef.current) {
+      cancelAnimationFrame(webcamRafRef.current);
+      webcamRafRef.current = null;
+    }
+    if (webcamStreamRef.current) {
+      webcamStreamRef.current.getTracks().forEach((t) => t.stop());
+      webcamStreamRef.current = null;
+    }
+    if (webcamRef.current) {
+      webcamRef.current.srcObject = null;
+      webcamRef.current.src = "";
+    }
+    detectorRef.current = null;
+    jointAnglesBufferRef.current = []; // Clear the rolling buffer
+    setDetectorReady(false);
+    setPracticeMode(false);
+    setUseTestVideo(false);
+    setPoseScore(null);
+    setDisplayedScore(null);
+    setWorstJoint(null);
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopPractice();
+    };
+  }, [stopPractice]);
+
+  // Test mode: run pose detection on reference video (no webcam panel needed)
+  useEffect(() => {
+    if (!practiceMode || !detectorReady || !useTestVideo) return;
+
+    let running = true;
+    let isDetecting = false;
+
+    const detector = detectorRef.current;
+    const refVideo = videoRef.current;
+
+    if (!detector || !refVideo) {
+      return;
+    }
+
+    async function runPoseDetection() {
+      if (!running || isDetecting) return;
+      if (!refVideo || refVideo.videoWidth === 0 || refVideo.videoHeight === 0 || refVideo.paused) {
+        // Skip detection if video not ready or paused
+        if (running) setTimeout(runPoseDetection, 100);
+        return;
+      }
+      
+      isDetecting = true;
+      
+      try {
+        const tf = await import("@tensorflow/tfjs");
+        
+        const inputTensor = tf.tidy(() => {
+          const img = tf.browser.fromPixels(refVideo);
+          const resized = tf.image.resizeBilinear(img, [192, 192]);
+          const casted = tf.cast(resized, "int32");
+          return tf.expandDims(casted, 0);
+        });
+
+        const result = (detector as { predict: (input: unknown) => { data: () => Promise<Float32Array>; dispose: () => void } }).predict(inputTensor);
+        const data = await result.data();
+        
+        inputTensor.dispose();
+        result.dispose();
+
+        // Parse keypoints (no mirroring in test mode)
+        const joints: Record<string, { x: number; y: number }> = {};
+        for (let i = 0; i < 17; i++) {
+          const y = data[i * 3];
+          const x = data[i * 3 + 1];
+          const score = data[i * 3 + 2];
+          
+          if (score > 0.3) {
+            const name = MOVENET_KEYPOINTS[i];
+            joints[name] = { x, y };
+          }
+        }
+        
+        latestUserJointsRef.current = joints;
+        
+        // Calculate angles and add to rolling buffer
+        const angles = calculateJointAngles(joints);
+        if (Object.keys(angles).length > 0) {
+          jointAnglesBufferRef.current.push(angles);
+          if (jointAnglesBufferRef.current.length > BUFFER_SIZE) {
+            jointAnglesBufferRef.current.shift();
+          }
+        }
+      } catch (err) {
+        // ignore individual frame errors
+      }
+      
+      isDetecting = false;
+      
+      if (running) {
+        setTimeout(runPoseDetection, 33);
+      }
+    }
+
+    runPoseDetection();
+
+    return () => {
+      running = false;
+    };
+  }, [practiceMode, detectorReady, useTestVideo]);
+
+  // Webcam mode: draw webcam feed and user skeleton
+  useEffect(() => {
+    if (!practiceMode || !detectorReady || useTestVideo) return;
+
+    let running = true;
+    let frameCount = 0;
+    let latestJoints: Record<string, { x: number; y: number }> | null = null;
+    let isDetecting = false;
+
+    // Small delay to ensure DOM has rendered the webcam panel
+    const startTimeout = setTimeout(() => {
+      const webcam = webcamRef.current;
+      const canvas = webcamCanvasRef.current;
+      const container = webcamContainerRef.current;
+      const detector = detectorRef.current;
+
+      if (!webcam || !canvas || !container || !detector) {
+        return;
+      }
+      
+      drawLoop();
+      runPoseDetection();
+
+      function drawLoop() {
+        if (!running) return;
+        
+        frameCount++;
+
+        const rect = container.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        canvas.style.width = `${rect.width}px`;
+        canvas.style.height = `${rect.height}px`;
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx || webcam.videoWidth === 0 || webcam.videoHeight === 0) {
+          webcamRafRef.current = requestAnimationFrame(drawLoop);
+          return;
+        }
+
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.scale(dpr, dpr);
+
+        const videoWidth = webcam.videoWidth;
+        const videoHeight = webcam.videoHeight;
+        const containerWidth = rect.width;
+        const containerHeight = rect.height;
+        
+        const scale = containerWidth / videoWidth;
+        const renderedWidth = containerWidth;
+        const renderedHeight = videoHeight * scale;
+        const offsetX = 0;
+        const offsetY = Math.max(0, (containerHeight - renderedHeight) / 2);
+
+        // Draw mirrored webcam feed
+        ctx.save();
+        ctx.translate(containerWidth, offsetY);
+        ctx.scale(-1, 1);
+        ctx.drawImage(webcam, 0, 0, renderedWidth, renderedHeight);
+        ctx.restore();
+
+        // Draw skeleton from latest detection results
+        if (latestJoints && Object.keys(latestJoints).length > 0) {
+          const toCanvas = (p: { x: number; y: number }) => ({
+            x: offsetX + p.x * renderedWidth,
+            y: offsetY + p.y * renderedHeight,
+          });
+
+          ctx.strokeStyle = "#FF6B6B";
+          ctx.lineWidth = 4;
+          ctx.lineCap = "round";
+          
+          for (const [a, b] of POSE_EDGES) {
+            const pa = latestJoints[a];
+            const pb = latestJoints[b];
+            if (!pa || !pb) continue;
+            const ca = toCanvas(pa);
+            const cb = toCanvas(pb);
+            ctx.beginPath();
+            ctx.moveTo(ca.x, ca.y);
+            ctx.lineTo(cb.x, cb.y);
+            ctx.stroke();
+          }
+
+          ctx.fillStyle = "#FFFFFF";
+          for (const name of POSE_JOINTS) {
+            const p = latestJoints[name];
+            if (!p) continue;
+            const c = toCanvas(p);
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, 6, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        webcamRafRef.current = requestAnimationFrame(drawLoop);
+      }
+
+      async function runPoseDetection() {
+        if (!running || isDetecting) return;
+        
+        isDetecting = true;
+        
+        try {
+          const tf = await import("@tensorflow/tfjs");
+          
+          const inputTensor = tf.tidy(() => {
+            const img = tf.browser.fromPixels(webcam);
+            const resized = tf.image.resizeBilinear(img, [192, 192]);
+            const casted = tf.cast(resized, "int32");
+            return tf.expandDims(casted, 0);
+          });
+
+          const result = (detector as { predict: (input: unknown) => { data: () => Promise<Float32Array>; dispose: () => void } }).predict(inputTensor);
+          const data = await result.data();
+          
+          inputTensor.dispose();
+          result.dispose();
+
+          const joints: Record<string, { x: number; y: number }> = {};
+          for (let i = 0; i < 17; i++) {
+            const y = data[i * 3];
+            const x = data[i * 3 + 1];
+            const score = data[i * 3 + 2];
+            
+            if (score > 0.3) {
+              const name = MOVENET_KEYPOINTS[i];
+              joints[name] = {
+                x: 1 - x, // Mirror for selfie view
+                y: y,
+              };
+            }
+          }
+          
+          latestJoints = joints;
+          latestUserJointsRef.current = joints;
+          
+          // Calculate angles and add to rolling buffer
+          const angles = calculateJointAngles(joints);
+          if (Object.keys(angles).length > 0) {
+            jointAnglesBufferRef.current.push(angles);
+            if (jointAnglesBufferRef.current.length > BUFFER_SIZE) {
+              jointAnglesBufferRef.current.shift();
+            }
+          }
+        } catch (err) {
+          // ignore individual frame errors
+        }
+        
+        isDetecting = false;
+        
+        if (running) {
+          setTimeout(runPoseDetection, 33);
+        }
+      }
+    }, 100);
+
+    return () => {
+      running = false;
+      clearTimeout(startTimeout);
+      if (webcamRafRef.current) {
+        cancelAnimationFrame(webcamRafRef.current);
+      }
+    };
+  }, [practiceMode, detectorReady, useTestVideo]);
+
+  // Send coaching requests to backend (throttled)
+  const sendCoachingRequest = useCallback(
+    async (
+      segmentId: number,
+      userMedianAngles: Record<string, number>,
+      matchLevel: "good" | "developing" | "needs_work"
+    ) => {
+      if (!jobId) return;
+
+      const segment = segments.find((s) => s.segment_id === segmentId);
+      const reference_angle_summary = segment?.angle_summary ?? {};
+
+      try {
+        setCoachingLoading(true);
+
+        const res = await fetch(`${API_URL}/coaching`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            segment_id: segmentId,
+            reference_angle_summary,
+            user_angles: userMedianAngles,
+            match_level: matchLevel,
+            skill_level: "beginner",
+            style: "contemporary",
+          }),
+        });
+
+        if (!res.ok) {
+          return;
+        }
+
+        const data = (await res.json()) as { note?: string };
+        if (data.note) {
+          setCoachingNote(data.note);
+        }
+      } catch (err) {
+        // swallow coaching errors; UI should keep working
+      } finally {
+        setCoachingLoading(false);
+      }
+    },
+    [jobId, segments]
+  );
+
+  // Pose comparison + coaching trigger effect - runs every 1 second using rolling buffer median
+  useEffect(() => {
+    if (!practiceMode || !detectorReady || skeletonFrames.length === 0) {
+      setPoseScore(null);
+      setDisplayedScore(null);
+      setWorstJoint(null);
+      jointAnglesBufferRef.current = []; // Clear buffer when stopping
+      segmentSecondsRef.current = 0;
+      return;
+    }
+
+    const compareInterval = setInterval(() => {
+      const video = videoRef.current;
+      const buffer = jointAnglesBufferRef.current;
+
+      // Need at least 10 frames in buffer for stable comparison
+      if (!video || buffer.length < 10) {
+        return;
+      }
+
+      // Get median angles from the rolling buffer
+      const userMedianAngles = getMedianAngles(buffer);
+      
+      if (Object.keys(userMedianAngles).length === 0) {
+        return;
+      }
+
+      // Find the reference frame closest to current video time
+      const timeMs = (video.currentTime ?? 0) * 1000;
+      let best = 0;
+      let bestDiff = Math.abs((skeletonFrames[0]?.timestamp_ms ?? 0) - timeMs);
+      for (let i = 1; i < skeletonFrames.length; i++) {
+        const diff = Math.abs((skeletonFrames[i]?.timestamp_ms ?? 0) - timeMs);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          best = i;
+        }
+      }
+
+      const frame = skeletonFrames[best];
+      const refLandmarks = frame?.landmarks ?? [];
+      if (refLandmarks.length === 0) return;
+
+      const refJoints = landmarkMap(refLandmarks);
+      const refAngles = calculateJointAngles(refJoints);
+
+      // Compare median user angles to reference
+      const { score, worstJoint: worst, jointsCompared } = comparePoses(userMedianAngles, refAngles);
+
+      // Only update if we have enough joints
+      if (score >= 0 && jointsCompared >= 2) {
+        setPoseScore(Math.round(score));
+        setWorstJoint(worst);
+
+         // Coaching trigger (only in real practice mode, not test mode)
+        if (!useTestVideo && activeSegmentId !== null) {
+          // Track how long we've been in this segment
+          segmentSecondsRef.current += 1; // compareInterval runs every 1s
+
+          const now = Date.now();
+          const timeSinceLast = now - lastCoachingTimeRef.current;
+
+          if (
+            segmentSecondsRef.current >= 5 && // at least 5s in this phrase
+            timeSinceLast >= 8000 && // throttle: max every 8s
+            !coachingLoading
+          ) {
+            // Reset dwell timer and update last coaching time
+            segmentSecondsRef.current = 0;
+            lastCoachingTimeRef.current = now;
+
+            let matchLevel: "good" | "developing" | "needs_work";
+            if (score >= 75) {
+              matchLevel = "good";
+            } else if (score >= 50) {
+              matchLevel = "developing";
+            } else {
+              matchLevel = "needs_work";
+            }
+
+            // Fire and forget; internal throttling prevents spam
+            void sendCoachingRequest(activeSegmentId, userMedianAngles, matchLevel);
+          }
+        } else {
+          // Not in a valid coaching state; reset dwell time
+          segmentSecondsRef.current = 0;
+        }
+      }
+    }, 1000); // Check every 1 second
+
+    return () => clearInterval(compareInterval);
+  }, [practiceMode, detectorReady, skeletonFrames, useTestVideo, activeSegmentId, coachingLoading, sendCoachingRequest]);
+
+  // Exponential moving average smoothing for displayed score (internal only)
+  useEffect(() => {
+    if (poseScore === null) {
+      setDisplayedScore(null);
+      return;
+    }
+
+    // If no displayed score yet, initialize directly
+    if (displayedScore === null) {
+      setDisplayedScore(poseScore);
+      return;
+    }
+
+    const alpha = 0.3;
+    const smoothed = Math.round(alpha * poseScore + (1 - alpha) * displayedScore);
+    setDisplayedScore(smoothed);
+  }, [poseScore]); // Only depend on poseScore, not displayedScore (to avoid infinite loop)
 
   const setRate = useCallback((rate: 1 | 0.75 | 0.5) => {
     setPlaybackRate(rate);
@@ -363,7 +1041,7 @@ export default function PlayerPage() {
 
   return (
     <div className="min-h-screen bg-[#0d0d0d] text-zinc-100 flex flex-col">
-      {/* Top bar: back + quality badge + speed */}
+      {/* Top bar */}
       <header className="flex items-center justify-between gap-4 px-4 py-3 border-b border-zinc-800 shrink-0">
         <button
           type="button"
@@ -373,6 +1051,36 @@ export default function PlayerPage() {
           ← Home
         </button>
         <div className="flex items-center gap-4">
+          {/* Practice mode button */}
+          {!practiceMode ? (
+            <>
+              <button
+                type="button"
+                onClick={() => startPractice(false)}
+                disabled={webcamLoading}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium transition bg-red-500/20 text-red-400 hover:bg-red-500/30"
+              >
+                {webcamLoading ? "Starting..." : "Start Practice"}
+              </button>
+              <button
+                type="button"
+                onClick={() => startPractice(true)}
+                disabled={webcamLoading}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium transition bg-purple-500/20 text-purple-400 hover:bg-purple-500/30"
+                title="Use reference video as input to test scoring accuracy"
+              >
+                Test Mode
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={stopPractice}
+              className="rounded-lg px-3 py-1.5 text-xs font-medium transition bg-zinc-700 text-white hover:bg-zinc-600"
+            >
+              Stop Practice
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setShowSkeleton((v) => !v)}
@@ -405,10 +1113,17 @@ export default function PlayerPage() {
         </div>
       </header>
 
+      {webcamError && (
+        <div className="px-4 py-2 bg-red-500/10 border-b border-red-500/30 text-red-400 text-sm">
+          {webcamError}
+        </div>
+      )}
+
       <div className="flex flex-1 min-h-0">
-        {/* Video — largest 16:9 box that fits, no cropping */}
-        <div className="flex-1 min-h-0 min-w-0 flex items-center justify-center p-2 sm:p-4">
-          <div className="w-full h-full flex items-center justify-center min-h-0 min-w-0">
+        {/* Main content: video panels */}
+        <div className="flex-1 min-h-0 min-w-0 flex gap-2 p-2 sm:p-4 relative">
+          {/* Left: Reference video */}
+          <div className={`${practiceMode && !useTestVideo ? "w-1/2" : "w-full"} h-full flex items-center justify-center transition-all`}>
             <div
               ref={videoContainerRef}
               className="w-full h-full max-w-full max-h-full aspect-video rounded-xl overflow-hidden bg-black relative"
@@ -416,6 +1131,7 @@ export default function PlayerPage() {
               <video
                 ref={videoRef}
                 src={`${API_URL}/video/${jobId}`}
+                crossOrigin="anonymous"
                 className="absolute inset-0 w-full h-full object-contain"
                 controls
                 playsInline
@@ -439,8 +1155,73 @@ export default function PlayerPage() {
                   />
                 </>
               )}
+              {practiceMode && (
+                <div className="absolute top-2 left-2 bg-black/60 rounded px-2 py-1 text-xs text-emerald-400 z-20">
+                  Reference
+                </div>
+              )}
             </div>
           </div>
+
+          {/* Center: Coaching feedback panel (only in real practice mode) */}
+          {practiceMode && !useTestVideo && (
+            <div className="absolute left-1/2 -translate-x-1/2 top-4 z-30 flex flex-col items-center pointer-events-none">
+              <div className="pointer-events-auto rounded-xl bg-black/70 border border-emerald-500/30 px-4 py-3 shadow-lg max-w-sm w-full transition-opacity duration-500">
+                <div className="flex items-center gap-2 mb-1">
+                  <div className={`h-2 w-2 rounded-full ${coachingLoading ? "bg-emerald-400 animate-pulse" : "bg-emerald-400/60"}`} />
+                  <span className="text-xs font-semibold uppercase tracking-wide text-emerald-300">
+                    Coaching
+                  </span>
+                </div>
+                <p
+                  className={`text-sm text-zinc-100 transition-opacity duration-500 ${
+                    coachingNote ? "opacity-100" : "opacity-70"
+                  }`}
+                >
+                  {coachingNote ??
+                    "Hold this phrase for a few seconds while we watch your lines, then coaching tips will appear here."}
+                </p>
+                {worstJoint && coachingNote && (
+                  <p className="mt-1 text-xs text-emerald-200/80">
+                    Focus area: <span className="font-medium capitalize">{worstJoint}</span>
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Right: Webcam panel (only in webcam mode, not test mode) */}
+          {practiceMode && !useTestVideo && (
+            <div className="w-1/2 h-full flex items-center justify-center">
+              <div
+                ref={webcamContainerRef}
+                className="w-full max-h-full aspect-video rounded-xl overflow-hidden bg-zinc-900 relative"
+              >
+                {/* Offscreen video element for webcam stream (must not be display:none for canvas to read) */}
+                <video
+                  ref={webcamRef}
+                  className="absolute w-0 h-0 opacity-0"
+                  playsInline
+                  muted
+                  autoPlay
+                />
+                {/* Canvas for webcam + skeleton overlay */}
+                <canvas
+                  ref={webcamCanvasRef}
+                  className="absolute inset-0 w-full h-full"
+                  style={{ zIndex: 10 }}
+                />
+                <div className="absolute top-2 left-2 bg-black/60 rounded px-2 py-1 text-xs z-20 text-red-400">
+                  You
+                </div>
+                {!detectorReady && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="size-8 border-2 border-red-500/30 border-t-red-500 rounded-full animate-spin" />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Segments sidebar */}
