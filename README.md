@@ -1,6 +1,6 @@
 # Learn a Choreo
 
-AI-powered dance learning platform that turns any YouTube choreography into an interactive lesson with real-time pose tracking and personalized coaching
+AI-powered dance learning platform that turns a YouTube dance video into an interactive lesson with real-time pose tracking and personalized coaching
 
 ## Requirements
 
