@@ -3,6 +3,16 @@ import json
 import os
 import re
 import uuid
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env: try choreo-ai-api first, then repo root (so choreo-ai-api wins)
+_app_dir = Path(__file__).resolve().parent
+_choreo_api_dir = _app_dir.parent
+_repo_root = _choreo_api_dir.parent
+load_dotenv(_repo_root / ".env")
+load_dotenv(_choreo_api_dir / ".env")
 
 import redis
 import httpx
@@ -55,6 +65,8 @@ class CoachingRequest(BaseModel):
     segment_id: int
     reference_angle_summary: dict[str, float]
     user_angles: dict[str, float]
+    user_joint_confidence: dict[str, float] | None = None
+    valid_joints: list[str] | None = None
     match_level: str  # "good", "developing", "needs_work"
     skill_level: str  # e.g. "beginner"
     style: str | None = None  # optional choreo style, e.g. "contemporary"
@@ -64,8 +76,18 @@ class CoachingResponse(BaseModel):
     note: str
 
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+
+
+def _get_anthropic_api_key() -> str:
+    """Read and normalize API key at request time (avoids stale/env issues)."""
+    raw = os.getenv("ANTHROPIC_API_KEY") or ""
+    return raw.strip().replace("\r", "")
+
+
+# Log at startup so you can confirm the key is loaded (length only, no leak)
+_key_len = len(_get_anthropic_api_key())
+print(f"[coaching] ANTHROPIC_API_KEY loaded: length={_key_len} (expected ~100+)")
 
 
 @app.post("/process")
@@ -91,7 +113,8 @@ async def generate_coaching_note(body: CoachingRequest):
       - match_level: 'good' | 'developing' | 'needs_work'
       - skill_level: e.g. 'beginner'
     """
-    if not ANTHROPIC_API_KEY:
+    api_key = _get_anthropic_api_key()
+    if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured on the server.")
 
     # Map canonical joint keys to the names we expect in angle_summary / user_angles
@@ -104,41 +127,90 @@ async def generate_coaching_note(body: CoachingRequest):
         "RIGHT_KNEE": "Right knee",
     }
 
+    def _get(body_map: dict, key: str):
+        # Accept uppercase and lowercase (pipeline uses lowercase)
+        return body_map.get(key) or body_map.get(key.lower())
+
     def get_angle(joint_key: str) -> tuple[float | None, float | None, float | None]:
-        ref_angle = body.reference_angle_summary.get(joint_key)
-        user_angle = body.user_angles.get(joint_key)
+        # Pipeline uses lowercase (left_elbow); frontend sends uppercase (LEFT_ELBOW). Accept both.
+        ref_angle = _get(body.reference_angle_summary, joint_key)
+        user_angle = _get(body.user_angles, joint_key)
         if ref_angle is None or user_angle is None:
             return None, None, None
         diff = user_angle - ref_angle  # signed: positive = over-extended, negative = under-extended
         return user_angle, ref_angle, diff
 
+    def get_confidence(joint_key: str) -> float | None:
+        if not body.user_joint_confidence:
+            return None
+        v = _get(body.user_joint_confidence, joint_key)
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    # Determine which joints are valid to discuss
+    valid_keys: list[str] = []
+    if body.valid_joints:
+        # Normalize provided list (support lower/upper)
+        provided = set([k.upper() for k in body.valid_joints if isinstance(k, str)])
+        for k in joint_keys.keys():
+            if k in provided:
+                valid_keys.append(k)
+    else:
+        for k in joint_keys.keys():
+            user_angle, ref_angle, _ = get_angle(k)
+            conf = get_confidence(k)
+            if user_angle is None or ref_angle is None:
+                continue
+            if float(user_angle) == 0.0:
+                continue
+            if conf is not None and conf < 0.3:
+                continue
+            valid_keys.append(k)
+
     lines: list[str] = []
-    for key, label in joint_keys.items():
+    for key in valid_keys:
+        label = joint_keys[key]
         user_angle, ref_angle, diff = get_angle(key)
         if user_angle is None or ref_angle is None or diff is None:
-            # Still include the line with "n/a" so Claude knows data is missing
-            lines.append(f"- {label}: n/a vs n/a = 0° off")
             continue
-        lines.append(
-            f"- {label}: {user_angle:.1f} vs {ref_angle:.1f} = {diff:.1f}° off"
-        )
+        lines.append(f"- {label}: {user_angle:.1f} vs {ref_angle:.1f} = {diff:.1f}° off")
 
     diffs_text = "\n".join(lines)
 
     style = body.style or "contemporary"
 
+    valid_labels = [joint_keys[k] for k in valid_keys]
+    valid_note = f"Note: only the following joints had valid detection data: {valid_labels}"
+
     prompt = (
         f"You are a supportive dance teacher giving real-time feedback to a {body.skill_level} dancer.\n\n"
         f"They are practicing phrase {body.segment_id} of a {style} choreography.\n\n"
+        f"{valid_note}\n\n"
         "Here are the joint angle differences between what they're doing and the reference "
         "(positive means they're over-extending, negative means under-extending):\n"
-        f"{diffs_text}\n\n"
+        f"{diffs_text if diffs_text else '(no valid joint angles available)'}\n\n"
         "Only mention joints where the difference is greater than 15°. "
         "If all joints are within 15°, give positive reinforcement about what they're doing well.\n\n"
         "Give exactly 1–2 sentences of specific, actionable feedback. "
         "Name the body part and describe what to do differently in plain movement language — not angles or numbers. "
-        "Sound like a human dance teacher, warm and direct."
+        "Sound like a human dance teacher, warm and direct. "
+        "Never give feedback about joints not listed in the Note line."
     )
+
+    # Debug: print structured joint comparison before calling Claude
+    print("JOINT COMPARISON:")
+    for key, label in joint_keys.items():
+        user_angle, ref_angle, diff = get_angle(key)
+        key_snake = label.lower().replace(" ", "_")
+        conf = get_confidence(key)
+        conf_str = f"{conf:.2f}" if conf is not None else "n/a"
+        if user_angle is None or ref_angle is None or diff is None:
+            print(f"{key_snake}:  user=n/a   ref=n/a   diff=0.0° conf={conf_str}")
+        else:
+            print(f"{key_snake}:  user={user_angle:.1f}° ref={ref_angle:.1f}° diff={diff:.1f}° conf={conf_str}")
+    print(f"VALID JOINTS: {valid_labels}")
 
     # Log prompt for debugging
     print("=== Claude coaching prompt ===")
@@ -150,7 +222,7 @@ async def generate_coaching_note(body: CoachingRequest):
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
+                    "x-api-key": api_key,
                     "anthropic-version": "2023-06-01",
                     "content-type": "application/json",
                 },

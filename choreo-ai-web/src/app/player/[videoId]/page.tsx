@@ -146,6 +146,21 @@ function calculateJointAngles(joints: Record<string, { x: number; y: number }>):
   return angles;
 }
 
+function calculateJointConfidence(
+  keypointScores: Record<string, number>
+): Record<string, number> {
+  const conf: Record<string, number> = {};
+  for (const { name, points } of JOINT_ANGLES) {
+    const [a, b, c] = points;
+    const ca = keypointScores[a];
+    const cb = keypointScores[b];
+    const cc = keypointScores[c];
+    if (ca === undefined || cb === undefined || cc === undefined) continue;
+    conf[name] = Math.min(ca, cb, cc);
+  }
+  return conf;
+}
+
 /** Calculate median of an array of numbers */
 function median(values: number[]): number {
   if (values.length === 0) return 0;
@@ -170,6 +185,20 @@ function getMedianAngles(buffer: Record<string, number>[]): Record<string, numbe
     }
   }
   
+  return result;
+}
+
+function getMedianConfidence(buffer: Record<string, number>[]): Record<string, number> {
+  if (buffer.length === 0) return {};
+  const result: Record<string, number> = {};
+  for (const { name } of JOINT_ANGLES) {
+    const values = buffer
+      .map((frame) => frame[name])
+      .filter((v): v is number => v !== undefined);
+    if (values.length >= 3) {
+      result[name] = median(values);
+    }
+  }
   return result;
 }
 
@@ -313,6 +342,10 @@ export default function PlayerPage() {
   const [coachingNote, setCoachingNote] = useState<string | null>(null);
   const [coachingLoading, setCoachingLoading] = useState(false);
 
+  // Positioning gate (preflight) before starting practice
+  const [positioningActive, setPositioningActive] = useState(false);
+  const [positioningWarning, setPositioningWarning] = useState<string | null>(null);
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const loopIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
@@ -326,14 +359,17 @@ export default function PlayerPage() {
   const detectorRef = useRef<unknown>(null);
   const webcamRafRef = useRef<number | null>(null);
   const latestUserJointsRef = useRef<Record<string, { x: number; y: number }> | null>(null);
+  const positioningOkRef = useRef(false);
   
   // Rolling buffer for pose smoothing (stores joint angles, not raw keypoints)
   const jointAnglesBufferRef = useRef<Record<string, number>[]>([]);
+  const jointConfidenceBufferRef = useRef<Record<string, number>[]>([]);
   const BUFFER_SIZE = 30;
 
   // Coaching timing/throttling
   const segmentSecondsRef = useRef<number>(0);
   const lastCoachingTimeRef = useRef<number>(0);
+  const lostBodyCountRef = useRef<number>(0);
 
   const segments = choreoData?.segments ?? [];
   const overallScore = choreoData?.quality_assessment?.overall_score ?? 0;
@@ -512,6 +548,8 @@ export default function PlayerPage() {
     setWebcamLoading(true);
     setWebcamError(null);
     setUseTestVideo(testMode);
+    setPositioningWarning(null);
+    positioningOkRef.current = false;
 
     try {
       if (!testMode) {
@@ -534,6 +572,9 @@ export default function PlayerPage() {
       
       // Set practice mode first so the video element renders
       setPracticeMode(true);
+      if (!testMode) {
+        setPositioningActive(true);
+      }
       
     } catch (err) {
       setWebcamError(err instanceof Error ? err.message : "Failed to access webcam");
@@ -557,7 +598,7 @@ export default function PlayerPage() {
     
     video.play()
       .then(() => {
-        setDetectorReady(true);
+        // detectorReady will be set after positioning preflight passes
       })
       .catch(() => {
         // ignore autoplay errors
@@ -587,9 +628,13 @@ export default function PlayerPage() {
     }
     detectorRef.current = null;
     jointAnglesBufferRef.current = []; // Clear the rolling buffer
+    jointConfidenceBufferRef.current = [];
     setDetectorReady(false);
     setPracticeMode(false);
     setUseTestVideo(false);
+    setPositioningActive(false);
+    setPositioningWarning(null);
+    positioningOkRef.current = false;
     setPoseScore(null);
     setDisplayedScore(null);
     setWorstJoint(null);
@@ -644,6 +689,7 @@ export default function PlayerPage() {
 
         // Parse keypoints (no mirroring in test mode)
         const joints: Record<string, { x: number; y: number }> = {};
+        const keypointScores: Record<string, number> = {};
         for (let i = 0; i < 17; i++) {
           const y = data[i * 3];
           const x = data[i * 3 + 1];
@@ -652,6 +698,7 @@ export default function PlayerPage() {
           if (score > 0.3) {
             const name = MOVENET_KEYPOINTS[i];
             joints[name] = { x, y };
+            keypointScores[name] = score;
           }
         }
         
@@ -663,6 +710,14 @@ export default function PlayerPage() {
           jointAnglesBufferRef.current.push(angles);
           if (jointAnglesBufferRef.current.length > BUFFER_SIZE) {
             jointAnglesBufferRef.current.shift();
+          }
+        }
+
+        const jointConf = calculateJointConfidence(keypointScores);
+        if (Object.keys(jointConf).length > 0) {
+          jointConfidenceBufferRef.current.push(jointConf);
+          if (jointConfidenceBufferRef.current.length > BUFFER_SIZE) {
+            jointConfidenceBufferRef.current.shift();
           }
         }
       } catch (err) {
@@ -805,6 +860,7 @@ export default function PlayerPage() {
           result.dispose();
 
           const joints: Record<string, { x: number; y: number }> = {};
+          const keypointScores: Record<string, number> = {};
           for (let i = 0; i < 17; i++) {
             const y = data[i * 3];
             const x = data[i * 3 + 1];
@@ -816,6 +872,7 @@ export default function PlayerPage() {
                 x: 1 - x, // Mirror for selfie view
                 y: y,
               };
+              keypointScores[name] = score;
             }
           }
           
@@ -829,6 +886,32 @@ export default function PlayerPage() {
             if (jointAnglesBufferRef.current.length > BUFFER_SIZE) {
               jointAnglesBufferRef.current.shift();
             }
+          }
+
+          const jointConf = calculateJointConfidence(keypointScores);
+          if (Object.keys(jointConf).length > 0) {
+            jointConfidenceBufferRef.current.push(jointConf);
+            if (jointConfidenceBufferRef.current.length > BUFFER_SIZE) {
+              jointConfidenceBufferRef.current.shift();
+            }
+          }
+
+          // If we lose ankles for a while during practice, re-activate positioning gate
+          const leftAnkleScore = data[15 * 3 + 2];
+          const rightAnkleScore = data[16 * 3 + 2];
+          if (leftAnkleScore > 0.3 && rightAnkleScore > 0.3) {
+            lostBodyCountRef.current = 0;
+          } else {
+            lostBodyCountRef.current += 1;
+          }
+
+          // After ~0.5s of missing ankles, pause tracking and ask user to reposition again
+          if (!positioningActive && detectorReady && lostBodyCountRef.current >= 15) {
+            positioningOkRef.current = false;
+            setDetectorReady(false);
+            setPositioningActive(true);
+            setPositioningWarning("Move further back — we can't see your full body.");
+            lostBodyCountRef.current = 0;
           }
         } catch (err) {
           // ignore individual frame errors
@@ -851,11 +934,84 @@ export default function PlayerPage() {
     };
   }, [practiceMode, detectorReady, useTestVideo]);
 
+  // Positioning preflight: require ankles visible before starting session
+  useEffect(() => {
+    if (!practiceMode || useTestVideo || !positioningActive) return;
+    const webcam = webcamRef.current;
+    const detector = detectorRef.current;
+    if (!webcam || !detector) return;
+
+    let running = true;
+    let okStreak = 0;
+    const start = Date.now();
+
+    const run = async () => {
+      if (!running) return;
+      if (positioningOkRef.current) return;
+
+      if (webcam.videoWidth === 0 || webcam.videoHeight === 0 || webcam.readyState < 2) {
+        setTimeout(run, 100);
+        return;
+      }
+
+      try {
+        const tf = await import("@tensorflow/tfjs");
+        const inputTensor = tf.tidy(() => {
+          const img = tf.browser.fromPixels(webcam);
+          const resized = tf.image.resizeBilinear(img, [192, 192]);
+          const casted = tf.cast(resized, "int32");
+          return tf.expandDims(casted, 0);
+        });
+
+        const result = (detector as { predict: (input: unknown) => { data: () => Promise<Float32Array>; dispose: () => void } }).predict(inputTensor);
+        const data = await result.data();
+        inputTensor.dispose();
+        result.dispose();
+
+        // MoveNet indices: LEFT_ANKLE=15, RIGHT_ANKLE=16
+        const leftAnkleScore = data[15 * 3 + 2];
+        const rightAnkleScore = data[16 * 3 + 2];
+
+        if (leftAnkleScore > 0.3 && rightAnkleScore > 0.3) {
+          okStreak += 1;
+        } else {
+          okStreak = 0;
+        }
+
+        const elapsed = Date.now() - start;
+        if (elapsed > 3000 && okStreak === 0) {
+          setPositioningWarning("Move further back — we can't see your full body.");
+        }
+
+        // Require a few consecutive frames to avoid flicker
+        if (okStreak >= 6) {
+          positioningOkRef.current = true;
+          setPositioningActive(false);
+          setPositioningWarning(null);
+          setDetectorReady(true);
+          return;
+        }
+      } catch {
+        // ignore
+      }
+
+      setTimeout(run, 100);
+    };
+
+    run();
+
+    return () => {
+      running = false;
+    };
+  }, [practiceMode, useTestVideo, positioningActive]);
+
   // Send coaching requests to backend (throttled)
   const sendCoachingRequest = useCallback(
     async (
       segmentId: number,
       userMedianAngles: Record<string, number>,
+      userMedianConfidence: Record<string, number>,
+      validJoints: string[],
       matchLevel: "good" | "developing" | "needs_work"
     ) => {
       if (!jobId) return;
@@ -875,6 +1031,8 @@ export default function PlayerPage() {
             segment_id: segmentId,
             reference_angle_summary,
             user_angles: userMedianAngles,
+            user_joint_confidence: userMedianConfidence,
+            valid_joints: validJoints,
             match_level: matchLevel,
             skill_level: "beginner",
             style: "contemporary",
@@ -905,6 +1063,7 @@ export default function PlayerPage() {
       setDisplayedScore(null);
       setWorstJoint(null);
       jointAnglesBufferRef.current = []; // Clear buffer when stopping
+      jointConfidenceBufferRef.current = [];
       segmentSecondsRef.current = 0;
       return;
     }
@@ -912,14 +1071,16 @@ export default function PlayerPage() {
     const compareInterval = setInterval(() => {
       const video = videoRef.current;
       const buffer = jointAnglesBufferRef.current;
+      const confBuffer = jointConfidenceBufferRef.current;
 
       // Need at least 10 frames in buffer for stable comparison
-      if (!video || buffer.length < 10) {
+      if (!video || buffer.length < 10 || confBuffer.length < 10) {
         return;
       }
 
       // Get median angles from the rolling buffer
       const userMedianAngles = getMedianAngles(buffer);
+      const userMedianConfidence = getMedianConfidence(confBuffer);
       
       if (Object.keys(userMedianAngles).length === 0) {
         return;
@@ -979,7 +1140,12 @@ export default function PlayerPage() {
             }
 
             // Fire and forget; internal throttling prevents spam
-            void sendCoachingRequest(activeSegmentId, userMedianAngles, matchLevel);
+            const validJoints = Object.keys(userMedianAngles).filter((k) => {
+              const a = userMedianAngles[k];
+              const c = userMedianConfidence[k] ?? 0;
+              return typeof a === "number" && a !== 0 && c >= 0.3;
+            });
+            void sendCoachingRequest(activeSegmentId, userMedianAngles, userMedianConfidence, validJoints, matchLevel);
           }
         } else {
           // Not in a valid coaching state; reset dwell time
@@ -1041,6 +1207,62 @@ export default function PlayerPage() {
 
   return (
     <div className="min-h-screen bg-[#0d0d0d] text-zinc-100 flex flex-col">
+      {/* Full-screen positioning guide overlay */}
+      {positioningActive && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="max-w-lg w-full rounded-2xl border border-emerald-500/30 bg-zinc-950/80 p-6 shadow-xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-semibold text-zinc-100">
+                  Step back until your full body is visible in frame
+                </h2>
+                <p className="mt-2 text-sm text-zinc-300">
+                  We’ll start once we can clearly detect both ankles. This improves tracking and coaching quality.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={stopPractice}
+                className="inline-flex items-center justify-center h-7 w-7 rounded-full border border-zinc-600 text-zinc-300 hover:text-white hover:border-zinc-300 transition"
+                aria-label="Exit practice"
+              >
+                <span className="sr-only">Exit practice</span>
+                <svg viewBox="0 0 20 20" className="h-3.5 w-3.5" aria-hidden="true">
+                  <path
+                    d="M5 5l10 10M15 5L5 15"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
+            </div>
+
+            <div className="mt-5 flex items-center justify-center">
+              {/* Simple stick figure guide */}
+              <svg viewBox="0 0 100 220" className="h-56 w-auto text-emerald-400/80">
+                {/* Head */}
+                <circle cx="50" cy="30" r="10" fill="none" stroke="currentColor" strokeWidth="3" />
+                {/* Spine */}
+                <line x1="50" y1="40" x2="50" y2="120" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                {/* Arms */}
+                <line x1="25" y1="70" x2="75" y2="70" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                {/* Legs */}
+                <line x1="50" y1="120" x2="30" y2="190" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                <line x1="50" y1="120" x2="70" y2="190" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+              </svg>
+            </div>
+
+            {positioningWarning && (
+              <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+                {positioningWarning}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Top bar */}
       <header className="flex items-center justify-between gap-4 px-4 py-3 border-b border-zinc-800 shrink-0">
         <button
