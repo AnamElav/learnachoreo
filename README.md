@@ -1,6 +1,6 @@
 # Learn a Choreo
 
-A dance learning platform for ingestion, pose extraction, and segmentation of choreography from video.
+AI-powered dance learning platform that turns a YouTube dance video into an interactive lesson with real-time pose tracking and personalized coaching
 
 ## Requirements
 
