@@ -70,6 +70,20 @@ class CoachingRequest(BaseModel):
     match_level: str  # "good", "developing", "needs_work"
     skill_level: str  # e.g. "beginner"
     style: str | None = None  # optional choreo style, e.g. "contemporary"
+    practice_mode: str | None = None  # "learn" | "dance" — affects feedback style
+    focus_joint: str | None = None  # e.g. LEFT_ELBOW — chunk drill: only this joint
+    diff_threshold_degrees: float | None = None  # default 20; chunk drill uses 25
+
+
+class PerformanceReviewRequest(BaseModel):
+    """Session log from Dance mode: samples with per-phrase joint diffs."""
+    entries: list[dict]
+
+
+class PerformanceReviewResponse(BaseModel):
+    overall_assessment: str
+    top_phrases: list[dict]  # { "segment_id": int, "reason": str }
+    next_session_focus: str
 
 
 class CoachingResponse(BaseModel):
@@ -169,34 +183,58 @@ async def generate_coaching_note(body: CoachingRequest):
                 continue
             valid_keys.append(k)
 
+    DIFF_THRESHOLD = float(body.diff_threshold_degrees) if body.diff_threshold_degrees is not None else 20.0
+
+    if body.focus_joint:
+        fk = body.focus_joint.upper()
+        if fk in joint_keys:
+            valid_keys = [fk]
+
     lines: list[str] = []
+    notable: list[str] = []  # joints with abs(diff) > threshold — only these may be mentioned
     for key in valid_keys:
         label = joint_keys[key]
         user_angle, ref_angle, diff = get_angle(key)
         if user_angle is None or ref_angle is None or diff is None:
             continue
         lines.append(f"- {label}: {user_angle:.1f} vs {ref_angle:.1f} = {diff:.1f}° off")
+        if abs(diff) > DIFF_THRESHOLD:
+            direction = "over-extended (ease back)" if diff > 0 else "under-extended (extend more)"
+            notable.append(f"{label}: {direction}")
 
     diffs_text = "\n".join(lines)
+    notable_text = "\n".join(notable) if notable else "(none — all joints within range)"
 
     style = body.style or "contemporary"
 
     valid_labels = [joint_keys[k] for k in valid_keys]
     valid_note = f"Note: only the following joints had valid detection data: {valid_labels}"
 
+    mode_instruction = ""
+    if (body.practice_mode or "").lower() == "learn":
+        mode_instruction = (
+            "The user is in learning mode. Pick ONE joint only. "
+            "Give one short sentence of specific, actionable feedback (max 15–20 words). No preamble or filler."
+        )
+    elif (body.practice_mode or "").lower() == "dance":
+        mode_instruction = (
+            "The user is dancing at full speed — give one short punchy cue they can act on immediately, "
+            "like a coach shouting from the sideline. Maximum 10 words."
+        )
+
     prompt = (
         f"You are a supportive dance teacher giving real-time feedback to a {body.skill_level} dancer.\n\n"
         f"They are practicing phrase {body.segment_id} of a {style} choreography.\n\n"
         f"{valid_note}\n\n"
-        "Here are the joint angle differences between what they're doing and the reference "
-        "(positive means they're over-extending, negative means under-extending):\n"
+        "Joint angle differences (positive = over-extending, negative = under-extending):\n"
         f"{diffs_text if diffs_text else '(no valid joint angles available)'}\n\n"
-        "Only mention joints where the difference is greater than 15°. "
-        "If all joints are within 15°, give positive reinforcement about what they're doing well.\n\n"
-        "Give exactly 1–2 sentences of specific, actionable feedback. "
-        "Name the body part and describe what to do differently in plain movement language — not angles or numbers. "
-        "Sound like a human dance teacher, warm and direct. "
-        "Never give feedback about joints not listed in the Note line."
+        f"Joints that need a correction (difference > {DIFF_THRESHOLD:.0f}°) — you MAY only give feedback about one of these:\n"
+        f"{notable_text}\n\n"
+    )
+    if mode_instruction:
+        prompt += f"{mode_instruction}\n\n"
+    prompt += (
+        "Rules: (1) Only mention a joint that appears in the 'Joints that need a correction' list above. Do not invent or assume. If that list says '(none)', give only brief positive reinforcement (e.g. 'Looking good'). (2) If you do mention a joint, your suggestion must match the direction in that list (e.g. if it says 'over-extended', suggest easing back, not extending more). (3) One short sentence only. No rambling or multiple corrections. Never give feedback about joints not in the valid list or not in the correction list."
     )
 
     # Debug: print structured joint comparison before calling Claude
@@ -263,11 +301,84 @@ async def generate_coaching_note(body: CoachingRequest):
 
         if not note:
             note = "Great effort on this phrase—keep breathing through the movement and stay connected to your lines."
+        else:
+            # Keep only the first sentence to avoid rambling
+            for end in (". ", "! ", "? ", "\n"):
+                i = note.find(end)
+                if i != -1:
+                    note = note[: i + 1].strip()
+                    break
 
         return CoachingResponse(note=note)
 
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Error calling Claude API: {exc}") from exc
+
+
+@app.post("/performance-review", response_model=PerformanceReviewResponse)
+async def performance_review(body: PerformanceReviewRequest):
+    """Summarize a Dance-mode session log with Claude."""
+    api_key = _get_anthropic_api_key()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured on the server.")
+
+    log_json = json.dumps(body.entries, indent=2)
+    prompt = (
+        "You are a dance coach reviewing practice session data. The log entries include segment_id (phrase), "
+        "timestamp_ms, and per_joint_abs_diff (degrees between the dancer and reference for each joint, sampled over time).\n\n"
+        f"SESSION LOG:\n{log_json}\n\n"
+        "Respond with exactly this JSON shape (no markdown, no extra text):\n"
+        '{"overall_assessment": "<2-4 sentences>", '
+        '"top_phrases": [{"segment_id": <number>, "reason": "<one sentence>"}, ...], '
+        '"next_session_focus": "<one sentence>"}\n\n'
+        "Include exactly 3 items in top_phrases for the phrases that need the most work (largest sustained joint errors). "
+        "If the log is sparse, infer what you can and still give constructive guidance."
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 1200,
+                    "system": "You output only valid JSON matching the user schema.",
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        text = ""
+        blocks = data.get("content") or []
+        if blocks and isinstance(blocks, list):
+            first = blocks[0]
+            if isinstance(first, dict) and "text" in first:
+                text = str(first["text"]).strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        if not text.startswith("{"):
+            # try to extract JSON
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1:
+                text = text[start : end + 1]
+        parsed = json.loads(text)
+        return PerformanceReviewResponse(
+            overall_assessment=str(parsed.get("overall_assessment", "")),
+            top_phrases=list(parsed.get("top_phrases", []))[:3],
+            next_session_focus=str(parsed.get("next_session_focus", "")),
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Error calling Claude API: {exc}") from exc
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail=f"Invalid review response: {exc}") from exc
 
 
 @app.get("/status/{job_id}")
