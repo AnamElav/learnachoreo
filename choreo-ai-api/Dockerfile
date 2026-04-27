@@ -8,19 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Single layer: install only runtime deps (no setuptools/wheel/dev)
-RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
-    pydantic \
-    "celery[redis]" \
-    redis \
-    mediapipe==0.10.14 \
-    opencv-python-headless \
-    numpy \
-    librosa \
-    yt-dlp \
-    ffmpeg-python
+# Install runtime dependencies from requirements file.
+COPY choreo-ai-api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app code (respects .dockerignore in context)
 COPY . .
