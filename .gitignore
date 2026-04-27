@@ -36,3 +36,6 @@ node_modules/
 npm-debug.log*
 celerybeat-schedule
 *.pid
+
+# Docs
+docs/

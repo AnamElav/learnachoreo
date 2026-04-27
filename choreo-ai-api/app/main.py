@@ -5,14 +5,22 @@ import re
 import uuid
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
 
-# Load .env: try choreo-ai-api first, then repo root (so choreo-ai-api wins)
-_app_dir = Path(__file__).resolve().parent
-_choreo_api_dir = _app_dir.parent
-_repo_root = _choreo_api_dir.parent
-load_dotenv(_repo_root / ".env")
-load_dotenv(_choreo_api_dir / ".env")
+    # Load .env in local development; production may not install python-dotenv.
+    _dotenv_available = True
+except ImportError:
+    _dotenv_available = False
+
+# Load .env only when python-dotenv is available.
+if _dotenv_available:
+    # Load .env: try choreo-ai-api first, then repo root (so choreo-ai-api wins)
+    _app_dir = Path(__file__).resolve().parent
+    _choreo_api_dir = _app_dir.parent
+    _repo_root = _choreo_api_dir.parent
+    load_dotenv(_repo_root / ".env")
+    load_dotenv(_choreo_api_dir / ".env")
 
 import redis
 import httpx
