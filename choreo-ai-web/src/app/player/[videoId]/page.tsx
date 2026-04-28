@@ -809,6 +809,7 @@ export default function PlayerPage() {
     let rafId: number;
 
     const draw = () => {
+      if (!container) return;
       const rect = container.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
       canvas.width = rect.width * dpr;
@@ -1245,6 +1246,7 @@ export default function PlayerPage() {
         
         frameCount++;
 
+        if (!container) return;
         const rect = container.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         canvas.width = rect.width * dpr;
