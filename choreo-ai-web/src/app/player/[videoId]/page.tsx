@@ -809,7 +809,7 @@ export default function PlayerPage() {
     let rafId: number;
 
     const draw = () => {
-      if (!container) return;
+      if (!canvas || !container || !video) return;
       const rect = container.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
       canvas.width = rect.width * dpr;
@@ -1246,7 +1246,7 @@ export default function PlayerPage() {
         
         frameCount++;
 
-        if (!container) return;
+        if (!webcam || !canvas || !container) return;
         const rect = container.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         canvas.width = rect.width * dpr;
@@ -1321,6 +1321,7 @@ export default function PlayerPage() {
 
       async function runPoseDetection() {
         if (!running || isDetecting) return;
+        if (!webcam) return;
         
         isDetecting = true;
         
@@ -2067,7 +2068,7 @@ export default function PlayerPage() {
     synth.cancel();
 
     const utterance = new SpeechSynthesisUtterance(coachingNote);
-    utterance.rate = practiceModeType === "dance" ? 1.2 : 0.95;
+    utterance.rate = 0.95;
     utterance.pitch = 1.0;
     const voice = ttsVoiceRef.current;
     if (voice) {
