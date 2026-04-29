@@ -35,7 +35,9 @@ from app.tasks import process_video, set_job_status, JOB_KEY_PREFIX
 app = FastAPI(title="Choreo AI API", version="0.1.0")
 
 _CORS_ALLOW_ORIGINS = {
+    # localhost vs 127.0.0.1 are different origins in browsers — include both for Next.js dev.
     "http://localhost:3000",
+    "http://127.0.0.1:3000",
     "https://learnachoreo.vercel.app",
 }
 _CORS_ALLOW_ORIGIN_REGEX = re.compile(r"^https://.*\.vercel\.app$")
