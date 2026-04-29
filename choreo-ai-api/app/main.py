@@ -26,7 +26,7 @@ import redis
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.config import REDIS_URL, OUTPUTS_DIR, SKELETONS_DIR
@@ -34,12 +34,15 @@ from app.tasks import process_video, set_job_status, JOB_KEY_PREFIX
 
 app = FastAPI(title="Choreo AI API", version="0.1.0")
 
+_CORS_ALLOW_ORIGINS = {
+    "http://localhost:3000",
+    "https://learnachoreo.vercel.app",
+}
+_CORS_ALLOW_ORIGIN_REGEX = re.compile(r"^https://.*\.vercel\.app$")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://learnachoreo.vercel.app",
-    ],
+    allow_origins=list(_CORS_ALLOW_ORIGINS),
     # FastAPI does not support wildcard entries in allow_origins like
     # "https://*.vercel.app"; use regex for Vercel preview deployments.
     allow_origin_regex=r"https://.*\.vercel\.app",
@@ -47,6 +50,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _is_allowed_origin(origin: str | None) -> bool:
+    if not origin:
+        return False
+    return origin in _CORS_ALLOW_ORIGINS or bool(_CORS_ALLOW_ORIGIN_REGEX.match(origin))
+
+
+@app.middleware("http")
+async def ensure_cors_on_errors(request: Request, call_next):
+    """
+    Ensure CORS headers are present even when request handling raises and returns 500.
+    This prevents browser masking backend failures as generic CORS errors.
+    """
+    origin = request.headers.get("origin")
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        response = JSONResponse(status_code=500, content={"detail": str(exc)})
+    if _is_allowed_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin  # required with credentials
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+    return response
 
 # Loose YouTube URL check
 YOUTUBE_PATTERN = re.compile(
