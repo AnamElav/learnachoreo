@@ -39,8 +39,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://learnachoreo.vercel.app",
-        "https://*.vercel.app",
     ],
+    # FastAPI does not support wildcard entries in allow_origins like
+    # "https://*.vercel.app"; use regex for Vercel preview deployments.
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
