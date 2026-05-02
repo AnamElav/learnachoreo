@@ -244,6 +244,24 @@ async def generate_coaching_note(body: CoachingRequest):
             direction = "over-extended (ease back)" if diff > 0 else "under-extended (extend more)"
             notable.append(f"{label}: {direction}")
 
+    match_level_norm = (body.match_level or "").lower()
+
+    # Chunk drill often fails on key-pose max diff while mean angles here look "within range".
+    # If the client says needs_work with a focus joint, always expose that joint as a correction target
+    # so the model is never told "(none) → say Looking good" while the UI shows Try again.
+    if match_level_norm == "needs_work" and body.focus_joint:
+        fk = body.focus_joint.upper()
+        if fk in joint_keys:
+            label = joint_keys[fk]
+            has_focus = any(s.startswith(f"{label}:") for s in notable)
+            if not has_focus:
+                user_angle, ref_angle, diff = get_angle(fk)
+                if user_angle is not None and ref_angle is not None and diff is not None:
+                    direction = "over-extended (ease back)" if diff > 0 else "under-extended (extend more)"
+                    notable.append(f"{label}: {direction} — chunk flagged this joint")
+                else:
+                    notable.append(f"{label}: adjust to match the reference shape more closely")
+
     diffs_text = "\n".join(lines)
     notable_text = "\n".join(notable) if notable else "(none — all joints within range)"
 
@@ -275,9 +293,24 @@ async def generate_coaching_note(body: CoachingRequest):
     )
     if mode_instruction:
         prompt += f"{mode_instruction}\n\n"
-    prompt += (
-        "Rules: (1) Only mention a joint that appears in the 'Joints that need a correction' list above. Do not invent or assume. If that list says '(none)', give only brief positive reinforcement (e.g. 'Looking good'). (2) If you do mention a joint, your suggestion must match the direction in that list (e.g. if it says 'over-extended', suggest easing back, not extending more). (3) One short sentence only. No rambling or multiple corrections. Never give feedback about joints not in the valid list or not in the correction list."
-    )
+
+    if match_level_norm == "needs_work":
+        prompt += (
+            "Rules — NEEDS WORK (this repetition did NOT pass): "
+            "(1) Give ONE sentence of corrective coaching. "
+            "Do NOT give praise-only replies such as 'Looking good', 'right on track', 'great job', or 'keep it up' without naming a concrete adjustment. "
+            "(2) Mention exactly one joint from the 'Joints that need a correction' list and align with its direction (over- vs under-extended). "
+            "(3) Maximum 20 words. No preamble.\n"
+        )
+    else:
+        prompt += (
+            "Rules: (1) Only mention a joint that appears in the 'Joints that need a correction' list above. Do not invent or assume. "
+            "If that list says '(none)', give only brief positive reinforcement (e.g. 'Looking good'). "
+            "(2) If you do mention a joint, your suggestion must match the direction in that list "
+            "(e.g. if it says 'over-extended', suggest easing back, not extending more). "
+            "(3) One short sentence only. No rambling or multiple corrections. "
+            "Never give feedback about joints not in the valid list or not in the correction list."
+        )
 
     # Debug: print structured joint comparison before calling Claude
     print("JOINT COMPARISON:")
@@ -309,7 +342,10 @@ async def generate_coaching_note(body: CoachingRequest):
                 json={
                     "model": ANTHROPIC_MODEL,
                     "max_tokens": 150,
-                    "system": "You are a supportive dance teacher. Always respond with 1–2 short sentences of coaching.",
+                    "system": (
+                        "You are a supportive dance teacher. Always respond with 1–2 short sentences of coaching. "
+                        "When the dancer missed the target (needs_work), prioritize clear corrective cues over generic praise."
+                    ),
                     "messages": [
                         {
                             "role": "user",
@@ -342,7 +378,15 @@ async def generate_coaching_note(body: CoachingRequest):
             note = ""
 
         if not note:
-            note = "Great effort on this phrase—keep breathing through the movement and stay connected to your lines."
+            if match_level_norm == "needs_work" and body.focus_joint:
+                fk = body.focus_joint.upper()
+                lab = joint_keys.get(fk)
+                if lab:
+                    note = f"Ease your {lab.lower()} toward the reference shape and give this chunk another try."
+                else:
+                    note = "Match the reference lines more closely on this chunk and try again."
+            else:
+                note = "Great effort on this phrase—keep breathing through the movement and stay connected to your lines."
         else:
             # Keep only the first sentence to avoid rambling
             for end in (". ", "! ", "? ", "\n"):

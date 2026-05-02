@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -33,6 +33,32 @@ interface ChoreoData {
   video_id?: string;
   quality_assessment?: { overall_score?: number };
   segments?: Segment[];
+}
+
+type RecordedAttemptKeyframe = {
+  timestamp_ms: number;
+  joints: Record<string, { x: number; y: number }>;
+};
+
+function smoothJointsEma(
+  current: Record<string, { x: number; y: number }>,
+  prev: Record<string, { x: number; y: number }> | null,
+  alpha = 0.3
+): Record<string, { x: number; y: number }> {
+  if (!prev) return { ...current };
+  const out: Record<string, { x: number; y: number }> = {};
+  for (const [name, p] of Object.entries(current)) {
+    const pp = prev[name];
+    if (!pp) {
+      out[name] = { ...p };
+      continue;
+    }
+    out[name] = {
+      x: alpha * p.x + (1 - alpha) * pp.x,
+      y: alpha * p.y + (1 - alpha) * pp.y,
+    };
+  }
+  return out;
 }
 
 /** Key joints for stick figure (excludes face/ear landmarks to avoid overlapping head circles). */
@@ -251,7 +277,22 @@ function msToTimestamp(ms: number): string {
 
 const CHUNK_MIN_MS = 4000;
 const CHUNK_MAX_MS = 6000;
-const CHUNK_DRILL_THRESHOLD_DEG = 25;
+/** Full-phrase learn drill evaluation only (chunk drill no longer gates on score). */
+const PHRASE_EVAL_THRESHOLD_DEG = 25;
+/** Countdown before the full-phrase run starts. */
+const PHRASE_PREP_COUNTDOWN_SEC = 5;
+
+/** Key poses: low movement-velocity valleys in reference skeleton, ≥0.5s apart. */
+const KEY_POSE_MIN_SEPARATION_MS = 500;
+const KEY_POSE_COUNT_MIN = 2;
+const KEY_POSE_COUNT_MAX = 3;
+
+/** MoveNet collapses — treat as tracking garbage (user readings only). */
+const KEY_POSE_USER_ANGLE_MIN_PLAUSIBLE = 8;
+const KEY_POSE_USER_ANGLE_MAX_PLAUSIBLE = 172;
+const KEY_POSE_PER_JOINT_CONF_MIN = 0.35;
+/** Need enough trustworthy joints per reference target after filters; else try next-closest keyframe. */
+const KEY_POSE_MIN_VALID_USER_JOINTS = 3;
 
 /** Split a phrase into sub-chunks of roughly 4–6 seconds each. */
 function splitSegmentIntoChunks(startMs: number, endMs: number): { startMs: number; endMs: number }[] {
@@ -368,13 +409,332 @@ function compareChunkToReference(
   return { pass: false, worstKey: focus.name, worstLabel: focus.label, worstDiff: focus.diff };
 }
 
+/** Largest joint vs reference diff for yellow highlight — no pass/fail threshold. */
+function pickHighlightJointForChunkFeedback(
+  userMed: Record<string, number>,
+  userMedConf: Record<string, number>,
+  refMed: Record<string, number>
+): { worstKey: string; worstLabel: string; worstDiff: number } | null {
+  const diffs: { name: string; label: string; diff: number; conf: number }[] = [];
+  for (const { name, label } of JOINT_ANGLES) {
+    const u = userMed[name];
+    const r = refMed[name];
+    if (u === undefined || r === undefined) continue;
+    diffs.push({ name, label, diff: Math.abs(u - r), conf: userMedConf[name] ?? 0 });
+  }
+  if (diffs.length === 0) return null;
+  const RELIABLE_CONF_MIN = 0.45;
+  const reliable = diffs.filter((d) => d.conf >= RELIABLE_CONF_MIN);
+  const pool = reliable.length > 0 ? reliable : diffs;
+  const sorted = [...pool].sort((a, b) => b.diff - a.diff);
+  const focus = sorted[0]!;
+  return { worstKey: focus.name, worstLabel: focus.label, worstDiff: focus.diff };
+}
+
+/**
+ * Max abs diff per joint across key-pose samples (mirrors former key-pose aggregation; no scoring gate).
+ */
+function pickHighlightJointFromKeyPosePoses(
+  poses: { user: Record<string, number>; ref: Record<string, number>; conf: Record<string, number> }[]
+): { worstKey: string; worstLabel: string; worstDiff: number } | null {
+  const jointAgg: { name: string; label: string; maxDiff: number; minConf: number }[] = [];
+  for (const { name, label } of JOINT_ANGLES) {
+    let maxDiff = 0;
+    let minConf = 1;
+    let any = false;
+    for (const p of poses) {
+      const u = p.user[name];
+      const r = p.ref[name];
+      if (u === undefined || r === undefined) continue;
+      if (!userJointPassesKeyPoseTrackingFilters(name, p.user, p.conf)) continue;
+      any = true;
+      const d = Math.abs(u - r);
+      if (d > maxDiff) maxDiff = d;
+      const c = p.conf[name] ?? 0;
+      if (c < minConf) minConf = c;
+    }
+    if (any) jointAgg.push({ name, label, maxDiff, minConf });
+  }
+  if (jointAgg.length === 0) return null;
+  const RELIABLE_CONF_MIN = 0.45;
+  const reliable = jointAgg.filter((j) => j.minConf >= RELIABLE_CONF_MIN);
+  const pool = reliable.length > 0 ? reliable : jointAgg;
+  const sorted = [...pool].sort((a, b) => b.maxDiff - a.maxDiff);
+  const focus = sorted[0]!;
+  return { worstKey: focus.name, worstLabel: focus.label, worstDiff: focus.maxDiff };
+}
+
+function averageJointDiff(
+  userAngles: Record<string, number>,
+  refAngles: Record<string, number>
+): { avgDiff: number; jointsCompared: number } {
+  let sum = 0;
+  let count = 0;
+  for (const { name } of JOINT_ANGLES) {
+    const u = userAngles[name];
+    const r = refAngles[name];
+    if (u === undefined || r === undefined) continue;
+    sum += Math.abs(u - r);
+    count += 1;
+  }
+  return { avgDiff: count > 0 ? sum / count : Number.POSITIVE_INFINITY, jointsCompared: count };
+}
+
+/** Sum of Euclidean distances per landmark name between consecutive frames (x,y plane). */
+function sumLandmarkDisplacement(prev: Landmark[], curr: Landmark[]): number {
+  if (prev.length === 0 || curr.length === 0) return 0;
+  const currByName = landmarkMap(curr);
+  let sum = 0;
+  let n = 0;
+  for (const p of prev) {
+    const q = currByName[p.name];
+    if (!q) continue;
+    const dx = p.x - q.x;
+    const dy = p.y - q.y;
+    sum += Math.hypot(dx, dy);
+    n += 1;
+  }
+  return n > 0 ? sum : 0;
+}
+
+function getSortedChunkSkeletonFrames(
+  frames: SkeletonFrame[],
+  startMs: number,
+  endMs: number
+): SkeletonFrame[] {
+  const inWin = frames.filter((f) => {
+    const t = f.timestamp_ms ?? 0;
+    return t >= startMs && t <= endMs;
+  });
+  inWin.sort((a, b) => (a.timestamp_ms ?? 0) - (b.timestamp_ms ?? 0));
+  return inWin;
+}
+
+/** velocities[i] = displacement from frames[i-1] → frames[i]; velocities[0] = 0. */
+function movementVelocitySeries(frames: SkeletonFrame[]): number[] {
+  const v: number[] = [0];
+  for (let i = 1; i < frames.length; i++) {
+    v.push(sumLandmarkDisplacement(frames[i - 1]?.landmarks ?? [], frames[i]?.landmarks ?? []));
+  }
+  return v;
+}
+
+function findMovementVelocityLocalMinimaIndices(velocities: number[]): number[] {
+  const out: number[] = [];
+  if (velocities.length < 4) return out;
+  for (let i = 2; i < velocities.length - 1; i++) {
+    const vi = velocities[i]!;
+    if (vi < velocities[i - 1]! && vi < velocities[i + 1]!) out.push(i);
+  }
+  return out;
+}
+
+function greedyPickKeyPoseIndicesByLowVelocity(
+  frames: SkeletonFrame[],
+  velocities: number[],
+  candidateIndices: number[],
+  minSepMs: number,
+  maxCount: number
+): number[] {
+  const sorted = [...candidateIndices].sort((a, b) => (velocities[a] ?? 0) - (velocities[b] ?? 0));
+  const picked: number[] = [];
+  for (const i of sorted) {
+    const ti = frames[i]?.timestamp_ms ?? 0;
+    if (picked.some((pi) => Math.abs(ti - (frames[pi]?.timestamp_ms ?? 0)) < minSepMs)) continue;
+    picked.push(i);
+    if (picked.length >= maxCount) break;
+  }
+  return picked;
+}
+
+function selectKeyPoseFrameIndices(
+  frames: SkeletonFrame[],
+  minSepMs: number,
+  minCount: number,
+  maxCount: number
+): { indices: number[]; velocities: number[]; source: "local_min" | "fallback_lowest" } {
+  const velocities = movementVelocitySeries(frames);
+  if (frames.length < 2) return { indices: [], velocities, source: "local_min" };
+
+  const localMinIdx = findMovementVelocityLocalMinimaIndices(velocities);
+  let picked = greedyPickKeyPoseIndicesByLowVelocity(frames, velocities, localMinIdx, minSepMs, maxCount);
+  let source: "local_min" | "fallback_lowest" = "local_min";
+
+  if (picked.length < minCount) {
+    const allMotion = Array.from({ length: frames.length - 1 }, (_, j) => j + 1);
+    picked = greedyPickKeyPoseIndicesByLowVelocity(frames, velocities, allMotion, minSepMs, maxCount);
+    source = "fallback_lowest";
+  }
+
+  picked.sort((a, b) => (frames[a]?.timestamp_ms ?? 0) - (frames[b]?.timestamp_ms ?? 0));
+  return { indices: picked, velocities, source };
+}
+
+function averageJointDiffAcrossKeyPoses(
+  pairs: { user: Record<string, number>; ref: Record<string, number> }[]
+): { avgDiff: number; jointsCompared: number } {
+  if (pairs.length === 0) return { avgDiff: Number.POSITIVE_INFINITY, jointsCompared: 0 };
+  let sum = 0;
+  let n = 0;
+  for (const p of pairs) {
+    const d = averageJointDiff(p.user, p.ref);
+    if (d.jointsCompared > 0) {
+      sum += d.avgDiff;
+      n += 1;
+    }
+  }
+  return { avgDiff: n > 0 ? sum / n : Number.POSITIVE_INFINITY, jointsCompared: n };
+}
+
+/** Mean per joint across key-pose samples (for coaching payload). */
+function userJointPassesKeyPoseTrackingFilters(
+  jointName: string,
+  userAngles: Record<string, number>,
+  conf: Record<string, number>
+): boolean {
+  const u = userAngles[jointName];
+  if (u === undefined) return false;
+  if (u < KEY_POSE_USER_ANGLE_MIN_PLAUSIBLE || u > KEY_POSE_USER_ANGLE_MAX_PLAUSIBLE) return false;
+  if ((conf[jointName] ?? 0) < KEY_POSE_PER_JOINT_CONF_MIN) return false;
+  return true;
+}
+
+/** Drop joints that fail tracking filters so mirror averaging matches key-pose aggregation. */
+function filterUserAnglesForKeyPoseMirrorCompare(
+  userAngles: Record<string, number>,
+  conf: Record<string, number>
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const { name } of JOINT_ANGLES) {
+    if (!userJointPassesKeyPoseTrackingFilters(name, userAngles, conf)) continue;
+    const u = userAngles[name];
+    if (u !== undefined) out[name] = u;
+  }
+  return out;
+}
+
+function countUserJointsAfterKeyPoseFilters(
+  userAngles: Record<string, number>,
+  conf: Record<string, number>
+): {
+  valid: number;
+  filteredExtremeAngle: number;
+  filteredLowConfidence: number;
+  missingAngle: number;
+} {
+  let valid = 0;
+  let filteredExtremeAngle = 0;
+  let filteredLowConfidence = 0;
+  let missingAngle = 0;
+  for (const { name } of JOINT_ANGLES) {
+    const u = userAngles[name];
+    if (u === undefined) {
+      missingAngle += 1;
+      continue;
+    }
+    if (u < KEY_POSE_USER_ANGLE_MIN_PLAUSIBLE || u > KEY_POSE_USER_ANGLE_MAX_PLAUSIBLE) {
+      filteredExtremeAngle += 1;
+      continue;
+    }
+    if ((conf[name] ?? 0) < KEY_POSE_PER_JOINT_CONF_MIN) {
+      filteredLowConfidence += 1;
+      continue;
+    }
+    valid += 1;
+  }
+  return { valid, filteredExtremeAngle, filteredLowConfidence, missingAngle };
+}
+
+function attemptKeyframeIndicesSortedByTimeProximity(
+  attemptKfs: RecordedAttemptKeyframe[],
+  targetMs: number
+): number[] {
+  return attemptKfs
+    .map((kf, i) => ({ i, d: Math.abs(kf.timestamp_ms - targetMs) }))
+    .sort((a, b) => a.d - b.d)
+    .map((x) => x.i);
+}
+
+type KeyPosePickAttemptLog = {
+  keyframeIndex: number;
+  keyframeTimestampMs: number;
+  deltaMsFromTarget: number;
+  validJointCount: number;
+  filteredExtremeAngle: number;
+  filteredLowConfidence: number;
+  missingAngle: number;
+  rejectedTooFewJoints: boolean;
+};
+
+type KeyPosePickResult = {
+  keyframeIndex: number;
+  user: Record<string, number>;
+  conf: Record<string, number>;
+  attempts: KeyPosePickAttemptLog[];
+};
+
+/**
+ * For each reference time, try closest user keyframes until one has ≥ KEY_POSE_MIN_VALID_USER_JOINTS
+ * joints passing angle + confidence filters.
+ */
+function pickUserKeyframeForReferenceKeyPose(
+  attemptKfs: RecordedAttemptKeyframe[],
+  confBuf: Record<string, number>[],
+  referenceTargetMs: number
+): KeyPosePickResult | null {
+  const ordered = attemptKeyframeIndicesSortedByTimeProximity(attemptKfs, referenceTargetMs);
+  const attempts: KeyPosePickAttemptLog[] = [];
+
+  for (const ik of ordered) {
+    const kf = attemptKfs[ik];
+    if (!kf) continue;
+    const user = calculateJointAngles(kf.joints);
+    const conf = ik >= 0 && ik < confBuf.length ? confBuf[ik]! : {};
+    const counts = countUserJointsAfterKeyPoseFilters(user, conf);
+    const rejected = counts.valid < KEY_POSE_MIN_VALID_USER_JOINTS;
+    attempts.push({
+      keyframeIndex: ik,
+      keyframeTimestampMs: kf.timestamp_ms,
+      deltaMsFromTarget: Math.abs(kf.timestamp_ms - referenceTargetMs),
+      validJointCount: counts.valid,
+      filteredExtremeAngle: counts.filteredExtremeAngle,
+      filteredLowConfidence: counts.filteredLowConfidence,
+      missingAngle: counts.missingAngle,
+      rejectedTooFewJoints: rejected,
+    });
+    if (!rejected) {
+      return { keyframeIndex: ik, user, conf, attempts };
+    }
+  }
+  return null;
+}
+
+function meanJointAnglesAcrossSamples(samples: Record<string, number>[]): Record<string, number> {
+  const acc: Record<string, number[]> = {};
+  for (const s of samples) {
+    for (const [k, v] of Object.entries(s)) {
+      if (!acc[k]) acc[k] = [];
+      acc[k]!.push(v);
+    }
+  }
+  const out: Record<string, number> = {};
+  for (const { name } of JOINT_ANGLES) {
+    const arr = acc[name];
+    if (arr && arr.length > 0) {
+      out[name] = arr.reduce((s, x) => s + x, 0) / arr.length;
+    }
+  }
+  return out;
+}
+
 type LearnDrillStep =
   | "preview"
   | "attempt"
-  | "evaluate"
-  | "evaluate_fail"
-  | "nice_pass"
-  | "put_together";
+  | "chunk_feedback"
+  | "phrase_prep"
+  | "put_together"
+  | "phrase_evaluate"
+  | "phrase_complete";
 
 interface LearnDrillState {
   segmentId: number;
@@ -382,6 +742,8 @@ interface LearnDrillState {
   chunks: { startMs: number; endMs: number }[];
   chunkIndex: number;
   step: LearnDrillStep;
+  /** Completed attempts on the current sub-chunk (for optional retry cap). */
+  chunkAttemptsOnSlice?: number;
 }
 
 interface DanceLogEntry {
@@ -400,6 +762,8 @@ interface TestDiagnostics {
   frameOffsetMs: number;
   mappingMode: "direct" | "lr_swapped";
 }
+
+type SessionMirrorMapping = "pending" | "direct" | "lr_swapped";
 
 function swapLeftRightJointAngles(angles: Record<string, number>): Record<string, number> {
   const swapped: Record<string, number> = {};
@@ -449,10 +813,19 @@ function drawSkeleton(
   joints: Record<string, { x: number; y: number }>,
   toCanvas: (p: { x: number; y: number }) => { x: number; y: number },
   strokeColor: string,
-  fillColor: string
+  fillColor: string,
+  opts?: {
+    focusJoint?: string | null;
+    highlightColor?: string;
+    baseLineWidth?: number;
+    jointRadius?: number;
+  }
 ) {
-  ctx.strokeStyle = strokeColor;
-  ctx.lineWidth = 2;
+  const highlight = opts?.focusJoint ?? null;
+  const hi = opts?.highlightColor ?? "#FBBF24";
+  const baseLw = opts?.baseLineWidth ?? 2;
+  const jointRadius = opts?.jointRadius ?? 4;
+
   ctx.lineCap = "round";
   for (const [a, b] of POSE_EDGES) {
     const pa = joints[a];
@@ -460,22 +833,64 @@ function drawSkeleton(
     if (!pa || !pb) continue;
     const ca = toCanvas(pa);
     const cb = toCanvas(pb);
+    const touches = highlight && (a === highlight || b === highlight);
+    ctx.strokeStyle = touches ? hi : strokeColor;
+    ctx.lineWidth = touches ? baseLw + 2 : baseLw;
     ctx.beginPath();
     ctx.moveTo(ca.x, ca.y);
     ctx.lineTo(cb.x, cb.y);
     ctx.stroke();
   }
 
-  ctx.fillStyle = fillColor;
-  const jointRadius = 4;
   for (const name of POSE_JOINTS) {
     const p = joints[name];
     if (!p) continue;
     const c = toCanvas(p);
+    const isFocus = highlight === name;
+    ctx.fillStyle = isFocus ? hi : fillColor;
     ctx.beginPath();
-    ctx.arc(c.x, c.y, jointRadius, 0, Math.PI * 2);
+    ctx.arc(c.x, c.y, isFocus ? jointRadius + 3 : jointRadius, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+function getJointAngleDef(jointName: string) {
+  return JOINT_ANGLES.find((j) => j.name === jointName);
+}
+
+/** Visual arc at vertex B between BA and BC, with degree label */
+function drawJointAngleArc(
+  ctx: CanvasRenderingContext2D,
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  c: { x: number; y: number },
+  angleDeg: number,
+  color: string
+) {
+  const ang1 = Math.atan2(a.y - b.y, a.x - b.x);
+  const ang2 = Math.atan2(c.y - b.y, c.x - b.x);
+  let sweep = ang2 - ang1;
+  while (sweep > Math.PI) sweep -= 2 * Math.PI;
+  while (sweep < -Math.PI) sweep += 2 * Math.PI;
+
+  const leg1 = Math.hypot(a.x - b.x, a.y - b.y);
+  const leg2 = Math.hypot(c.x - b.x, c.y - b.y);
+  const r = Math.min(52, leg1 * 0.28, leg2 * 0.28);
+
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  ctx.arc(b.x, b.y, r, ang1, ang1 + sweep, sweep < 0);
+  ctx.stroke();
+
+  const mid = ang1 + sweep / 2;
+  const lx = b.x + Math.cos(mid) * (r + 16);
+  const ly = b.y + Math.sin(mid) * (r + 16);
+  ctx.fillStyle = color;
+  ctx.font = "bold 11px ui-monospace, system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(`${angleDeg.toFixed(0)}°`, lx, ly);
 }
 
 export default function PlayerPage() {
@@ -489,6 +904,7 @@ export default function PlayerPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [playbackRate, setPlaybackRate] = useState<1 | 0.75 | 0.5>(1);
+  const [isReferenceMirrored, setIsReferenceMirrored] = useState(false);
   const [activeSegmentId, setActiveSegmentId] = useState<number | null>(null);
   const [showSkeleton, setShowSkeleton] = useState(false);
   const [skeletonFrames, setSkeletonFrames] = useState<SkeletonFrame[]>([]);
@@ -505,6 +921,11 @@ export default function PlayerPage() {
   const [poseScore, setPoseScore] = useState<number | null>(null);
   const [worstJoint, setWorstJoint] = useState<string | null>(null);
   const [displayedScore, setDisplayedScore] = useState<number | null>(null); // Smoothed score (internal only)
+  const [sessionMirrorMapping, setSessionMirrorMapping] = useState<SessionMirrorMapping>("pending");
+  const [completedLearnDrillSegmentId, setCompletedLearnDrillSegmentId] = useState<number | null>(null);
+  const [fullPhraseEvalResult, setFullPhraseEvalResult] = useState<{ pass: boolean; note: string } | null>(null);
+  const sessionMirrorMappingRef = useRef<SessionMirrorMapping>("pending");
+  sessionMirrorMappingRef.current = sessionMirrorMapping;
 
   // Coaching state
   const [coachingNote, setCoachingNote] = useState<string | null>(null);
@@ -559,9 +980,12 @@ export default function PlayerPage() {
   learnDrillRef.current = learnDrill;
   const learnAttemptBufferRef = useRef<Record<string, number>[]>([]);
   const learnAttemptConfidenceBufferRef = useRef<Record<string, number>[]>([]);
+  /** Raw MoveNet joints + capture timestamp per inference frame during chunk attempts. */
+  const learnAttemptKeypointsBufferRef = useRef<RecordedAttemptKeyframe[]>([]);
   const putTogetherBufferRef = useRef<Record<string, number>[]>([]);
   const learnCaptureRef = useRef<"none" | "chunk_attempt" | "put_together">("none");
-  const chunkEvaluateRanRef = useRef(false);
+  /** Last chunk feedback run key `${chunkIndex}-${attemptOnSlice}` — avoids duplicate processing. */
+  const chunkFeedbackProcessedKeyRef = useRef<string>("");
   const putTogetherStartedRef = useRef(false);
   const queuedAttemptStartRef = useRef(false);
 
@@ -579,6 +1003,40 @@ export default function PlayerPage() {
   const [preAttemptCountdownSec, setPreAttemptCountdownSec] = useState<number | null>(null);
   const preAttemptCountdownRef = useRef<number | null>(null);
   preAttemptCountdownRef.current = preAttemptCountdownSec;
+  /** 5 → ... → 1 before full-phrase "put it together" starts after the last chunk. */
+  const [phrasePrepCountdownSec, setPhrasePrepCountdownSec] = useState<number | null>(null);
+
+  /** Saved keyframes from the last chunk attempt — used for synced post-attempt review playback. */
+  const [attemptReviewKeypoints, setAttemptReviewKeypoints] = useState<RecordedAttemptKeyframe[]>([]);
+  /** Ref mirrors state so chunk feedback runs with the keyframes from the attempt that just ended. */
+  const attemptReviewKeypointsRef = useRef<RecordedAttemptKeyframe[]>([]);
+  attemptReviewKeypointsRef.current = attemptReviewKeypoints;
+  const [chunkReviewPlayback, setChunkReviewPlayback] = useState(false);
+  const chunkReviewPlaybackRef = useRef(false);
+  const replayJointsRef = useRef<Record<string, { x: number; y: number }> | null>(null);
+  const prevAttemptSmoothedJointsRef = useRef<Record<string, { x: number; y: number }> | null>(null);
+  chunkReviewPlaybackRef.current = chunkReviewPlayback;
+
+  /** Hide floating Learn drill card during attempt replay so videos stay unobstructed; reopen via bottom bar. */
+  const [learnFeedbackPanelVisible, setLearnFeedbackPanelVisible] = useState(true);
+
+  useEffect(() => {
+    if (chunkReviewPlayback) {
+      setLearnFeedbackPanelVisible(false);
+    } else {
+      setLearnFeedbackPanelVisible(true);
+    }
+  }, [chunkReviewPlayback]);
+
+  /** Attempt-review debug: live scrub time + worst joint from last chunk evaluation */
+  const [reviewPlaybackTimeMs, setReviewPlaybackTimeMs] = useState(0);
+  const [chunkDrillFocusJoint, setChunkDrillFocusJoint] = useState<string | null>(null);
+  const chunkDrillFocusJointRef = useRef<string | null>(null);
+  chunkDrillFocusJointRef.current = chunkDrillFocusJoint;
+
+  const [debugMode, setDebugMode] = useState(() => process.env.NODE_ENV === "development");
+  const debugModeRef = useRef(debugMode);
+  debugModeRef.current = debugMode;
 
   const segments = choreoData?.segments ?? [];
   const overallScore = choreoData?.quality_assessment?.overall_score ?? 0;
@@ -661,9 +1119,19 @@ export default function PlayerPage() {
     learnCaptureRef.current = "none";
     learnAttemptBufferRef.current = [];
     learnAttemptConfidenceBufferRef.current = [];
-    chunkEvaluateRanRef.current = false;
+    learnAttemptKeypointsBufferRef.current = [];
+    prevAttemptSmoothedJointsRef.current = null;
+    setAttemptReviewKeypoints([]);
+    setChunkReviewPlayback(false);
+    replayJointsRef.current = null;
+    setChunkDrillFocusJoint(null);
+    setReviewPlaybackTimeMs(0);
+    setCompletedLearnDrillSegmentId(null);
+    setFullPhraseEvalResult(null);
+    chunkFeedbackProcessedKeyRef.current = "";
     queuedAttemptStartRef.current = false;
     setPreAttemptCountdownSec(null);
+    setPhrasePrepCountdownSec(null);
   }, []);
 
   const playSegment = useCallback(
@@ -689,11 +1157,13 @@ export default function PlayerPage() {
       }
 
       setActiveSegmentId(seg.segment_id);
+      setCompletedLearnDrillSegmentId(null);
+      setFullPhraseEvalResult(null);
       setCoachingNote(null);
       setSuggestDanceMode(false);
       learnModeSecondsRef.current = 0;
 
-      // Learn: chunk drill (preview → attempt → evaluate per sub-chunk)
+      // Learn: chunk drill (preview → attempt → feedback per sub-chunk)
       if (willChunkDrill) {
         setShowSkeleton(true);
         const chunks = splitSegmentIntoChunks(seg.start_time_ms, seg.end_time_ms);
@@ -703,14 +1173,22 @@ export default function PlayerPage() {
           chunks,
           chunkIndex: 0,
           step: "preview",
+          chunkAttemptsOnSlice: 0,
         };
         learnDrillRef.current = newDrill;
         setLearnDrill(newDrill);
         learnCaptureRef.current = "none";
         learnAttemptBufferRef.current = [];
         learnAttemptConfidenceBufferRef.current = [];
-        chunkEvaluateRanRef.current = false;
+        learnAttemptKeypointsBufferRef.current = [];
+        prevAttemptSmoothedJointsRef.current = null;
+        setAttemptReviewKeypoints([]);
+        setChunkReviewPlayback(false);
+        setChunkDrillFocusJoint(null);
+        setReviewPlaybackTimeMs(0);
+        chunkFeedbackProcessedKeyRef.current = "";
         setPreAttemptCountdownSec(null);
+        setPhrasePrepCountdownSec(null);
         setPlaybackRate(0.5);
         video.playbackRate = 0.5;
         const c0 = chunks[0];
@@ -799,6 +1277,92 @@ export default function PlayerPage() {
     };
   }, [learnDrill?.chunkIndex, learnDrill?.step]);
 
+  /** Post-attempt review: loop the reference chunk at 0.5× and sync saved webcam keyframes to video time */
+  useEffect(() => {
+    if (!chunkReviewPlayback) {
+      replayJointsRef.current = null;
+      return;
+    }
+    const ld = learnDrillRef.current;
+    if (!ld || ld.step !== "chunk_feedback") {
+      replayJointsRef.current = null;
+      return;
+    }
+    if (attemptReviewKeypoints.length === 0) {
+      replayJointsRef.current = null;
+      return;
+    }
+    const video = videoRef.current;
+    if (!video) return;
+
+    const c = ld.chunks[ld.chunkIndex];
+    if (!c) return;
+
+    const startSec = c.startMs / 1000;
+    const endSec = c.endMs / 1000;
+    const keyframes = attemptReviewKeypoints;
+
+    video.playbackRate = 0.5;
+    video.currentTime = startSec;
+    void video.play().catch(() => {
+      /* Interrupted by pause() during effect transitions — ignore */
+    });
+
+    if (loopIntervalRef.current) {
+      clearInterval(loopIntervalRef.current);
+      loopIntervalRef.current = null;
+    }
+    loopIntervalRef.current = setInterval(() => {
+      const v = videoRef.current;
+      if (!v || !chunkReviewPlaybackRef.current) return;
+      if (v.currentTime >= endSec - 0.08) {
+        v.currentTime = startSec;
+      }
+    }, 200);
+
+    const syncReplay = () => {
+      const v = videoRef.current;
+      if (!v) return;
+      const span = endSec - startSec;
+      if (span <= 0 || keyframes.length === 0) {
+        replayJointsRef.current = null;
+        return;
+      }
+      const targetCaptureMs = v.currentTime * 1000;
+      let best = keyframes[0];
+      let bestDiff = Math.abs(best.timestamp_ms - targetCaptureMs);
+      for (let i = 1; i < keyframes.length; i++) {
+        const diff = Math.abs(keyframes[i].timestamp_ms - targetCaptureMs);
+        if (diff < bestDiff) {
+          best = keyframes[i];
+          bestDiff = diff;
+        }
+      }
+      replayJointsRef.current =
+        best && Object.keys(best.joints).length > 0 ? { ...best.joints } : null;
+      setReviewPlaybackTimeMs(v.currentTime * 1000);
+    };
+
+    video.addEventListener("timeupdate", syncReplay);
+    video.addEventListener("seeked", syncReplay);
+    syncReplay();
+
+    return () => {
+      video.removeEventListener("timeupdate", syncReplay);
+      video.removeEventListener("seeked", syncReplay);
+      replayJointsRef.current = null;
+      if (loopIntervalRef.current) {
+        clearInterval(loopIntervalRef.current);
+        loopIntervalRef.current = null;
+      }
+      // Only pause when review mode is off. If review stays on but deps changed (e.g. leaving chunk_feedback),
+      // pausing here interrupts the in-flight play() and surfaces AbortError in dev.
+      if (!chunkReviewPlaybackRef.current) {
+        video.pause();
+      }
+    };
+  }, [chunkReviewPlayback, learnDrill?.step, learnDrill?.chunkIndex, attemptReviewKeypoints]);
+
   // Draw reference skeleton overlay synced to video time
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -861,18 +1425,43 @@ export default function PlayerPage() {
       const offsetY = (containerHeight - renderedHeight) / 2;
 
       const toCanvas = (p: { x: number; y: number }) => ({
-        x: offsetX + p.x * renderedWidth,
+        x: offsetX + (isReferenceMirrored ? 1 - p.x : p.x) * renderedWidth,
         y: offsetY + p.y * renderedHeight,
       });
 
-      drawSkeleton(ctx, joints, toCanvas, "#00FF88", "#FFFFFF");
+      const chunkFeedbackReplayFocus =
+        chunkReviewPlaybackRef.current &&
+        learnDrillRef.current?.step === "chunk_feedback" &&
+        chunkDrillFocusJointRef.current;
+      drawSkeleton(ctx, joints, toCanvas, "#00FF88", "#FFFFFF", {
+        focusJoint: chunkFeedbackReplayFocus ? chunkDrillFocusJointRef.current : null,
+        highlightColor: "#FBBF24",
+      });
+
+      const fj = chunkDrillFocusJointRef.current;
+      if (chunkFeedbackReplayFocus && fj) {
+        const def = getJointAngleDef(fj);
+        if (def) {
+          const [na, nb, nc] = def.points;
+          const ja = joints[na];
+          const jb = joints[nb];
+          const jc = joints[nc];
+          if (ja && jb && jc) {
+            const angMap = calculateJointAngles(joints);
+            const angVal = angMap[def.name];
+            if (angVal !== undefined) {
+              drawJointAngleArc(ctx, toCanvas(ja), toCanvas(jb), toCanvas(jc), angVal, "#FBBF24");
+            }
+          }
+        }
+      }
 
       rafId = requestAnimationFrame(draw);
     };
 
     draw();
     return () => cancelAnimationFrame(rafId);
-  }, [showSkeleton, skeletonFrames]);
+  }, [showSkeleton, skeletonFrames, isReferenceMirrored]);
 
   // Start practice mode: init webcam (or test video) and MoveNet
   const startPractice = useCallback(async (testMode = false) => {
@@ -883,6 +1472,7 @@ export default function PlayerPage() {
     setUseTestVideo(testMode);
     setPositioningWarning(null);
     positioningOkRef.current = false;
+    setSessionMirrorMapping("pending");
 
     try {
       if (!testMode) {
@@ -955,13 +1545,23 @@ export default function PlayerPage() {
   useEffect(() => {
     if (!practiceMode || useTestVideo || practiceModeType !== "learn") return;
     if (learnDrill || activeSegmentId === null) return;
+    if (completedLearnDrillSegmentId === activeSegmentId) return;
     const seg = segments.find((s) => s.segment_id === activeSegmentId);
     if (!seg) return;
     console.log("[chunk-drill] auto-starting selected phrase after Start Practice", {
       segmentId: activeSegmentId,
     });
     playSegment(seg);
-  }, [practiceMode, useTestVideo, practiceModeType, learnDrill, activeSegmentId, segments, playSegment]);
+  }, [
+    practiceMode,
+    useTestVideo,
+    practiceModeType,
+    learnDrill,
+    activeSegmentId,
+    completedLearnDrillSegmentId,
+    segments,
+    playSegment,
+  ]);
 
   // Stop practice mode
   const stopPractice = useCallback(() => {
@@ -992,13 +1592,24 @@ export default function PlayerPage() {
     setLearnDrill(null);
     learnDrillRef.current = null;
     learnCaptureRef.current = "none";
+    learnAttemptBufferRef.current = [];
+    learnAttemptConfidenceBufferRef.current = [];
+    learnAttemptKeypointsBufferRef.current = [];
+    prevAttemptSmoothedJointsRef.current = null;
+    setAttemptReviewKeypoints([]);
+    setChunkReviewPlayback(false);
+    replayJointsRef.current = null;
+    setChunkDrillFocusJoint(null);
+    setReviewPlaybackTimeMs(0);
     dancePerformanceLogRef.current = [];
     setPerformanceReview(null);
     setTestDiagnostics(null);
     putTogetherStartedRef.current = false;
     queuedAttemptStartRef.current = false;
     setPreAttemptCountdownSec(null);
-    learnAttemptConfidenceBufferRef.current = [];
+    setSessionMirrorMapping("pending");
+    setCompletedLearnDrillSegmentId(null);
+    setFullPhraseEvalResult(null);
   }, []);
 
   const endDanceSession = useCallback(async () => {
@@ -1243,7 +1854,7 @@ export default function PlayerPage() {
 
       function drawLoop() {
         if (!running) return;
-        
+
         frameCount++;
 
         if (!webcam || !canvas || !container) return;
@@ -1275,44 +1886,53 @@ export default function PlayerPage() {
         const offsetX = 0;
         const offsetY = Math.max(0, (containerHeight - renderedHeight) / 2);
 
-        // Draw mirrored webcam feed
-        ctx.save();
-        ctx.translate(containerWidth, offsetY);
-        ctx.scale(-1, 1);
-        ctx.drawImage(webcam, 0, 0, renderedWidth, renderedHeight);
-        ctx.restore();
+        const reviewing = chunkReviewPlaybackRef.current;
+        const skeletonJoints = reviewing ? replayJointsRef.current : latestJoints;
 
-        // Draw skeleton from latest detection results
-        if (latestJoints && Object.keys(latestJoints).length > 0) {
+        if (!reviewing) {
+          ctx.save();
+          ctx.translate(containerWidth, offsetY);
+          ctx.scale(-1, 1);
+          ctx.drawImage(webcam, 0, 0, renderedWidth, renderedHeight);
+          ctx.restore();
+        } else {
+          ctx.fillStyle = "#111111";
+          ctx.fillRect(0, offsetY, containerWidth, renderedHeight);
+        }
+
+        if (skeletonJoints && Object.keys(skeletonJoints).length > 0) {
           const toCanvas = (p: { x: number; y: number }) => ({
-            x: offsetX + p.x * renderedWidth,
+            x: offsetX + (reviewing && isReferenceMirrored ? 1 - p.x : p.x) * renderedWidth,
             y: offsetY + p.y * renderedHeight,
           });
 
-          ctx.strokeStyle = "#FF6B6B";
-          ctx.lineWidth = 4;
-          ctx.lineCap = "round";
-          
-          for (const [a, b] of POSE_EDGES) {
-            const pa = latestJoints[a];
-            const pb = latestJoints[b];
-            if (!pa || !pb) continue;
-            const ca = toCanvas(pa);
-            const cb = toCanvas(pb);
-            ctx.beginPath();
-            ctx.moveTo(ca.x, ca.y);
-            ctx.lineTo(cb.x, cb.y);
-            ctx.stroke();
-          }
+          const chunkFeedbackReplayFocus =
+            reviewing &&
+            learnDrillRef.current?.step === "chunk_feedback" &&
+            chunkDrillFocusJointRef.current;
+          drawSkeleton(ctx, skeletonJoints, toCanvas, "#FF6B6B", "#FFFFFF", {
+            focusJoint: chunkFeedbackReplayFocus ? chunkDrillFocusJointRef.current : null,
+            highlightColor: "#FBBF24",
+            baseLineWidth: 4,
+            jointRadius: 6,
+          });
 
-          ctx.fillStyle = "#FFFFFF";
-          for (const name of POSE_JOINTS) {
-            const p = latestJoints[name];
-            if (!p) continue;
-            const c = toCanvas(p);
-            ctx.beginPath();
-            ctx.arc(c.x, c.y, 6, 0, Math.PI * 2);
-            ctx.fill();
+          const fj = chunkDrillFocusJointRef.current;
+          if (chunkFeedbackReplayFocus && fj) {
+            const def = getJointAngleDef(fj);
+            if (def) {
+              const [na, nb, nc] = def.points;
+              const ja = skeletonJoints[na];
+              const jb = skeletonJoints[nb];
+              const jc = skeletonJoints[nc];
+              if (ja && jb && jc) {
+                const angMap = calculateJointAngles(skeletonJoints);
+                const angVal = angMap[def.name];
+                if (angVal !== undefined) {
+                  drawJointAngleArc(ctx, toCanvas(ja), toCanvas(jb), toCanvas(jc), angVal, "#FBBF24");
+                }
+              }
+            }
           }
         }
 
@@ -1322,7 +1942,12 @@ export default function PlayerPage() {
       async function runPoseDetection() {
         if (!running || isDetecting) return;
         if (!webcam) return;
-        
+        if (chunkReviewPlaybackRef.current) {
+          isDetecting = false;
+          if (running) setTimeout(runPoseDetection, 33);
+          return;
+        }
+
         isDetecting = true;
         
         try {
@@ -1360,7 +1985,16 @@ export default function PlayerPage() {
           
           latestJoints = joints;
           latestUserJointsRef.current = joints;
-          
+
+          if (learnCaptureRef.current === "chunk_attempt") {
+            const smoothedJoints = smoothJointsEma(joints, prevAttemptSmoothedJointsRef.current, 0.3);
+            prevAttemptSmoothedJointsRef.current = smoothedJoints;
+            learnAttemptKeypointsBufferRef.current.push({
+              timestamp_ms: (videoRef.current?.currentTime ?? 0) * 1000,
+              joints: { ...smoothedJoints },
+            });
+          }
+
           // Calculate angles — learn chunk / put-together use dedicated buffers
           const angles = calculateJointAngles(joints);
           if (Object.keys(angles).length > 0) {
@@ -1398,14 +2032,15 @@ export default function PlayerPage() {
           }
 
           // After ~0.5s of missing ankles, re-gate — but not while user is idle in chunk drill
-          // (preview / nice_pass / evaluate_fail) or during the pre-attempt countdown, so stepping
+          // (preview / chunk_feedback) or during the pre-attempt countdown, so stepping
           // back to tap "Start your turn" doesn't flip detectorReady off.
           const ldGate = learnDrillRef.current;
           const suppressLostBodyGate =
-            ldGate &&
-            (ldGate.step === "preview" ||
-              ldGate.step === "nice_pass" ||
-              ldGate.step === "evaluate_fail");
+            chunkReviewPlaybackRef.current ||
+            (ldGate &&
+              (ldGate.step === "preview" ||
+                ldGate.step === "chunk_feedback" ||
+                ldGate.step === "phrase_prep"));
           if (
             !suppressLostBodyGate &&
             !positioningActive &&
@@ -1437,7 +2072,7 @@ export default function PlayerPage() {
         cancelAnimationFrame(webcamRafRef.current);
       }
     };
-  }, [practiceMode, detectorReady, useTestVideo]);
+  }, [practiceMode, detectorReady, useTestVideo, isReferenceMirrored]);
 
   // Positioning preflight: require ankles visible before starting session
   useEffect(() => {
@@ -1562,6 +2197,9 @@ export default function PlayerPage() {
 
         const data = (await res.json()) as { note?: string };
         if (data.note) {
+          if (learnDrillRef.current?.step !== "chunk_feedback") {
+            return;
+          }
           setCoachingNote(data.note);
         }
       } catch (err) {
@@ -1583,23 +2221,31 @@ export default function PlayerPage() {
     const c = ld.chunks[ld.chunkIndex];
     learnAttemptBufferRef.current = [];
     learnAttemptConfidenceBufferRef.current = [];
+    learnAttemptKeypointsBufferRef.current = [];
+    prevAttemptSmoothedJointsRef.current = null;
+    setChunkReviewPlayback(false);
+    replayJointsRef.current = null;
+    setChunkDrillFocusJoint(null);
     learnCaptureRef.current = "chunk_attempt";
-    chunkEvaluateRanRef.current = false;
     if (loopIntervalRef.current) {
       clearInterval(loopIntervalRef.current);
       loopIntervalRef.current = null;
     }
+    const fromChunkFeedback = ld.step === "chunk_feedback";
     const next = { ...ld, step: "attempt" as const };
     learnDrillRef.current = next;
     setLearnDrill(next);
     video.currentTime = c.startMs / 1000;
     video.playbackRate = 0.5;
     video.play();
-    console.log("[chunk-drill] STATE preview → attempt", {
-      chunkIndex: ld.chunkIndex,
-      startMs: c.startMs,
-      endMs: c.endMs,
-    });
+    console.log(
+      `[chunk-drill] STATE ${fromChunkFeedback ? "chunk_feedback" : "preview"} → attempt`,
+      {
+        chunkIndex: ld.chunkIndex,
+        startMs: c.startMs,
+        endMs: c.endMs,
+      }
+    );
     console.log("[chunk-drill] attempt recording START (buffer cleared, MoveNet frames = 0)");
   }, []);
 
@@ -1618,10 +2264,14 @@ export default function PlayerPage() {
     console.log("[chunk-drill] pre-attempt countdown started (3…2…1)");
   }, [detectorReady]);
 
-  const retryChunkAfterFail = useCallback(() => {
+  const retryChunkFromFeedback = useCallback(() => {
     const ld = learnDrillRef.current;
-    if (!ld || ld.step !== "evaluate_fail") return;
+    if (!ld || ld.step !== "chunk_feedback") return;
+    const n = ld.chunkAttemptsOnSlice ?? 0;
+    if (n >= 3) return;
     if (preAttemptCountdownRef.current !== null) return;
+    setChunkReviewPlayback(false);
+    replayJointsRef.current = null;
     setCoachingNote(null);
     if (!detectorReady) {
       queuedAttemptStartRef.current = true;
@@ -1639,7 +2289,7 @@ export default function PlayerPage() {
     if (!queuedAttemptStartRef.current) return;
     if (!practiceMode || useTestVideo || positioningActive || !detectorReady) return;
     const ld = learnDrillRef.current;
-    if (!ld || (ld.step !== "preview" && ld.step !== "evaluate_fail")) return;
+    if (!ld || (ld.step !== "preview" && ld.step !== "chunk_feedback")) return;
     queuedAttemptStartRef.current = false;
     console.log("[chunk-drill] body gate passed — starting pre-attempt countdown");
     setCoachingNote(null);
@@ -1651,16 +2301,8 @@ export default function PlayerPage() {
     if (preAttemptCountdownSec === null) return;
     if (preAttemptCountdownSec === 0) {
       const ld = learnDrillRef.current;
-      if (ld && (ld.step === "preview" || ld.step === "evaluate_fail")) {
+      if (ld && (ld.step === "preview" || ld.step === "chunk_feedback")) {
         beginChunkAttempt(ld);
-        if (ld.step === "evaluate_fail") {
-          console.log("[chunk-drill] STATE evaluate_fail → attempt (retry)", {
-            chunkIndex: ld.chunkIndex,
-            startMs: ld.chunks[ld.chunkIndex]?.startMs,
-            endMs: ld.chunks[ld.chunkIndex]?.endMs,
-          });
-          console.log("[chunk-drill] attempt recording START (retry, buffer cleared, MoveNet frames = 0)");
-        }
       }
       setPreAttemptCountdownSec(null);
       return;
@@ -1671,7 +2313,38 @@ export default function PlayerPage() {
     return () => clearTimeout(t);
   }, [preAttemptCountdownSec, beginChunkAttempt]);
 
-  // Attempt: countdown + transition to evaluate
+  // Entering full phrase: start countdown + spoken cue after last-chunk feedback.
+  useEffect(() => {
+    if (learnDrill?.step !== "phrase_prep") return;
+    setPhrasePrepCountdownSec(PHRASE_PREP_COUNTDOWN_SEC);
+    if (typeof window !== "undefined" && typeof window.speechSynthesis !== "undefined") {
+      const synth = window.speechSynthesis;
+      synth.cancel();
+      const utterance = new SpeechSynthesisUtterance("Now put it all together!");
+      utterance.rate = 0.98;
+      const voice = ttsVoiceRef.current;
+      if (voice) utterance.voice = voice;
+      synth.speak(utterance);
+    }
+  }, [learnDrill?.step, learnDrill?.segmentId]);
+
+  // 3 → 2 → 1 → 0, then start put_together capture.
+  useEffect(() => {
+    if (phrasePrepCountdownSec === null) return;
+    if (phrasePrepCountdownSec === 0) {
+      setPhrasePrepCountdownSec(null);
+      setLearnDrill((prev) =>
+        prev?.step === "phrase_prep" ? { ...prev, step: "put_together" } : prev
+      );
+      return;
+    }
+    const t = window.setTimeout(() => {
+      setPhrasePrepCountdownSec((c) => (c === null ? null : c - 1));
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [phrasePrepCountdownSec]);
+
+  // Attempt: countdown + transition to chunk feedback after recording
   useEffect(() => {
     const v = videoRef.current;
     if (!learnDrill || learnDrill.step !== "attempt" || !v) return;
@@ -1681,16 +2354,34 @@ export default function PlayerPage() {
       const remain = Math.max(0, Math.ceil(c.endMs / 1000 - v.currentTime));
       setAttemptCountdownSec(remain);
       if (v.currentTime >= c.endMs / 1000 - 0.12) {
+        // `timeupdate` can fire repeatedly near the cut — only finalize once, and never snapshot after
+        // the buffer was cleared (second fire would call setAttemptReviewKeypoints([]) and wipe replay).
+        if (learnCaptureRef.current !== "chunk_attempt") return;
+        v.removeEventListener("timeupdate", onTimeUpdate);
         v.pause();
         const frameCount = learnAttemptBufferRef.current.length;
+        const keyframes = learnAttemptKeypointsBufferRef.current.map((frame) => ({
+          timestamp_ms: frame.timestamp_ms,
+          joints: { ...frame.joints },
+        }));
+        learnAttemptKeypointsBufferRef.current = [];
+        setAttemptReviewKeypoints(keyframes);
         learnCaptureRef.current = "none";
-        chunkEvaluateRanRef.current = false;
         console.log("[chunk-drill] attempt recording END", {
           chunkIndex: learnDrill.chunkIndex,
           movenetFramesInBuffer: frameCount,
+          keyframeFramesInBuffer: keyframes.length,
         });
-        console.log("[chunk-drill] STATE attempt → evaluate", { chunkIndex: learnDrill.chunkIndex });
-        setLearnDrill((prev) => (prev ? { ...prev, step: "evaluate" } : prev));
+        console.log("[chunk-drill] STATE attempt → chunk_feedback", { chunkIndex: learnDrill.chunkIndex });
+        setLearnDrill((prev) =>
+          prev
+            ? {
+                ...prev,
+                step: "chunk_feedback",
+                chunkAttemptsOnSlice: (prev.chunkAttemptsOnSlice ?? 0) + 1,
+              }
+            : prev
+        );
       }
     };
     v.addEventListener("timeupdate", onTimeUpdate);
@@ -1698,100 +2389,318 @@ export default function PlayerPage() {
     return () => v.removeEventListener("timeupdate", onTimeUpdate);
   }, [learnDrill?.step, learnDrill?.chunkIndex]);
 
-  // Evaluate sub-chunk vs reference window
+  // Chunk drill feedback (no score gate): highlight worst joint + coaching note; user chooses retry vs continue.
   useEffect(() => {
     const ld = learnDrillRef.current;
-    if (!ld || ld.step !== "evaluate") return;
+    if (!ld || ld.step !== "chunk_feedback") return;
     if (!skeletonFrames.length) {
-      console.log("[chunk-drill] evaluation SKIPPED (no skeleton frames loaded yet)");
+      console.log("[chunk-drill] feedback SKIPPED (no skeleton frames loaded yet)");
       return;
     }
-    if (chunkEvaluateRanRef.current) return;
-    chunkEvaluateRanRef.current = true;
+    const attemptNum = ld.chunkAttemptsOnSlice ?? 0;
+    const dedupeKey = `${ld.chunkIndex}-${attemptNum}`;
+    if (chunkFeedbackProcessedKeyRef.current === dedupeKey) return;
+    chunkFeedbackProcessedKeyRef.current = dedupeKey;
+
     const chunk = ld.chunks[ld.chunkIndex];
-    const userMed = getMedianAngles(learnAttemptBufferRef.current);
-    const userMedConf = getMedianConfidence(learnAttemptConfidenceBufferRef.current);
+    const attemptKfs = attemptReviewKeypointsRef.current;
+
+    const chunkFrames = getSortedChunkSkeletonFrames(skeletonFrames, chunk.startMs, chunk.endMs);
+    const {
+      indices: kpIndices,
+      velocities: kpVelocities,
+      source: kpSource,
+    } = selectKeyPoseFrameIndices(
+      chunkFrames,
+      KEY_POSE_MIN_SEPARATION_MS,
+      KEY_POSE_COUNT_MIN,
+      KEY_POSE_COUNT_MAX
+    );
+    const keyPoseTimes = kpIndices.map((i) => chunkFrames[i]?.timestamp_ms ?? 0);
+    const keyPoseMeta = kpIndices.map((i) => ({
+      skeletonWindowFrameIndex: i,
+      refTimestampMs: chunkFrames[i]?.timestamp_ms ?? null,
+      movementVelocity: kpVelocities[i] ?? null,
+    }));
+
+    const keyPoseCandidatesOk =
+      kpIndices.length >= KEY_POSE_COUNT_MIN &&
+      attemptKfs.length > 0 &&
+      chunkFrames.length >= 2;
+
+    const confBufForKeyPose = learnAttemptConfidenceBufferRef.current;
+    const keyPosePickRows: { referenceTargetMs: number; pick: KeyPosePickResult }[] = [];
+
+    if (keyPoseCandidatesOk) {
+      for (const t of keyPoseTimes) {
+        const pick = pickUserKeyframeForReferenceKeyPose(attemptKfs, confBufForKeyPose, t);
+        if (pick) {
+          keyPosePickRows.push({ referenceTargetMs: t, pick });
+          console.log("[chunk-drill] key pose user keyframe selection", {
+            referenceTargetMs: t,
+            chosenKeyframeIndex: pick.keyframeIndex,
+            chosenKeyframeMs: attemptKfs[pick.keyframeIndex]?.timestamp_ms,
+            deltaMsFromTarget: Math.abs((attemptKfs[pick.keyframeIndex]?.timestamp_ms ?? 0) - t),
+            candidateKeyframesTried: pick.attempts.length,
+            attempts: pick.attempts,
+          });
+        } else {
+          console.log("[chunk-drill] key pose dropped — no user keyframe met joint-count threshold after filters", {
+            referenceTargetMs: t,
+            angleRangePlausibleDeg: [
+              KEY_POSE_USER_ANGLE_MIN_PLAUSIBLE,
+              KEY_POSE_USER_ANGLE_MAX_PLAUSIBLE,
+            ],
+            perJointConfMin: KEY_POSE_PER_JOINT_CONF_MIN,
+            minValidJointsRequired: KEY_POSE_MIN_VALID_USER_JOINTS,
+          });
+        }
+      }
+    }
+
+    const useKeyPoseEval =
+      keyPoseCandidatesOk && keyPosePickRows.length >= KEY_POSE_COUNT_MIN;
+
     console.log("[chunk-drill] evaluation RUN", {
       chunkIndex: ld.chunkIndex,
       windowMs: { start: chunk.startMs, end: chunk.endMs },
       bufferFrameCount: learnAttemptBufferRef.current.length,
+      attemptKeyframeCount: attemptKfs.length,
+      keyPoseEval: useKeyPoseEval,
+      keyPosePicksAfterTrackingFilters: keyPosePickRows.length,
+      keyPoseDetection: {
+        skeletonFramesInChunk: chunkFrames.length,
+        selectionSource: kpSource,
+        selectedKeyPoseCount: kpIndices.length,
+        keyPoses: keyPoseMeta,
+      },
     });
-    console.log("[chunk-drill] evaluation user median joint angles (from buffer)", userMed);
-    console.log("[chunk-drill] evaluation user median joint confidence (from buffer)", userMedConf);
+
+    let userMed: Record<string, number>;
+    let userMedConf: Record<string, number>;
+    let refMedDirect: Record<string, number>;
+    let refMedSwapped: Record<string, number>;
+    let directAvg: { avgDiff: number; jointsCompared: number };
+    let swappedAvg: { avgDiff: number; jointsCompared: number };
+    let refMed: Record<string, number>;
+    let evaluationMode: "key_pose" | "median_window";
+    let highlight: { worstKey: string; worstLabel: string; worstDiff: number } | null = null;
+
+    if (useKeyPoseEval) {
+      evaluationMode = "key_pose";
+      console.log("[chunk-drill] key pose timestamps (reference, movement valleys)", {
+        refTimestampsMs: keyPosePickRows.map((r) => r.referenceTargetMs),
+        minSeparationMs: KEY_POSE_MIN_SEPARATION_MS,
+      });
+
+      const pairsDirect = keyPosePickRows.map(({ referenceTargetMs: t, pick }) => ({
+        user: filterUserAnglesForKeyPoseMirrorCompare(pick.user, pick.conf),
+        ref: interpolatedAnglesAtTime(skeletonFrames, t),
+      }));
+      const pairsSwapped = keyPosePickRows.map(({ referenceTargetMs: t, pick }) => ({
+        user: filterUserAnglesForKeyPoseMirrorCompare(pick.user, pick.conf),
+        ref: swapLeftRightJointAngles(interpolatedAnglesAtTime(skeletonFrames, t)),
+      }));
+
+      directAvg = averageJointDiffAcrossKeyPoses(pairsDirect);
+      swappedAvg = averageJointDiffAcrossKeyPoses(pairsSwapped);
+
+      refMedDirect = meanJointAnglesAcrossSamples(
+        keyPosePickRows.map(({ referenceTargetMs: t }) => interpolatedAnglesAtTime(skeletonFrames, t))
+      );
+      refMedSwapped = meanJointAnglesAcrossSamples(
+        keyPosePickRows.map(({ referenceTargetMs: t }) =>
+          swapLeftRightJointAngles(interpolatedAnglesAtTime(skeletonFrames, t))
+        )
+      );
+
+      if (sessionMirrorMappingRef.current === "pending") {
+        const lockSwapped = swappedAvg.avgDiff < directAvg.avgDiff;
+        const locked: SessionMirrorMapping = lockSwapped ? "lr_swapped" : "direct";
+        setSessionMirrorMapping(locked);
+        console.log(`[mirror] mirror locked: ${lockSwapped ? "swapped" : "direct"} (key-pose avg diff)`);
+      }
+      const useSwappedMapping =
+        sessionMirrorMappingRef.current === "pending"
+          ? swappedAvg.avgDiff < directAvg.avgDiff
+          : sessionMirrorMappingRef.current === "lr_swapped";
+
+      const poses = keyPosePickRows.map(({ referenceTargetMs: t, pick }) => {
+        const baseRef = interpolatedAnglesAtTime(skeletonFrames, t);
+        const ref = useSwappedMapping ? swapLeftRightJointAngles(baseRef) : baseRef;
+        return { user: pick.user, ref, conf: pick.conf };
+      });
+
+      userMed = meanJointAnglesAcrossSamples(
+        keyPosePickRows.map(({ pick }) => filterUserAnglesForKeyPoseMirrorCompare(pick.user, pick.conf))
+      );
+      userMedConf = getMedianConfidence(poses.map((p) => p.conf));
+      refMed = meanJointAnglesAcrossSamples(poses.map((p) => p.ref));
+      highlight =
+        pickHighlightJointFromKeyPosePoses(poses) ??
+        pickHighlightJointForChunkFeedback(userMed, userMedConf, refMed);
+
+      console.log("[chunk-drill] mirror avg diff check (key poses)", {
+        directAvgDiff: Number.isFinite(directAvg.avgDiff) ? Number(directAvg.avgDiff.toFixed(2)) : null,
+        swappedAvgDiff: Number.isFinite(swappedAvg.avgDiff) ? Number(swappedAvg.avgDiff.toFixed(2)) : null,
+        directJointsCompared: directAvg.jointsCompared,
+        swappedJointsCompared: swappedAvg.jointsCompared,
+      });
+      console.log("[chunk-drill] evaluation user mean joint angles (key poses)", userMed);
+      console.log("[chunk-drill] evaluation reference mean joint angles (key poses, chosen mapping)", refMed);
+      console.log(
+        "[chunk-drill] evaluation reference mapping chosen",
+        useSwappedMapping ? "lr_swapped" : "direct"
+      );
+
+      const perPoseLog = keyPosePickRows.map(({ referenceTargetMs: t, pick }, i) => {
+        const ut = attemptKfs[pick.keyframeIndex]?.timestamp_ms ?? null;
+        return {
+          referenceTargetMs: t,
+          closestUserKeyframeMs: ut,
+          absDeltaMs: ut !== null ? Math.abs(t - ut) : null,
+          pickAttempts: pick.attempts,
+          diffsDeg: computeChunkJointDiffsForLog(poses[i]!.user, poses[i]!.ref),
+        };
+      });
+      console.log("[chunk-drill] key pose per-target alignment & joint diffs (°)", perPoseLog);
+    } else {
+      evaluationMode = "median_window";
+      console.log("[chunk-drill] key pose eval unavailable — falling back to median entire window", {
+        reason:
+          kpIndices.length < KEY_POSE_COUNT_MIN
+            ? "not_enough_key_poses"
+            : attemptKfs.length === 0
+              ? "no_attempt_keyframes"
+              : chunkFrames.length < 2
+                ? "chunk_too_short"
+                : keyPosePickRows.length < KEY_POSE_COUNT_MIN
+                  ? "too_few_valid_user_keyframes_after_tracking_filters"
+                  : "unknown",
+        keyPosePicksAfterFilters: keyPosePickRows.length,
+      });
+
+      userMed = getMedianAngles(learnAttemptBufferRef.current);
+      userMedConf = getMedianConfidence(learnAttemptConfidenceBufferRef.current);
+      refMedDirect = medianAnglesForSkeletonWindow(skeletonFrames, chunk.startMs, chunk.endMs);
+      refMedSwapped = swapLeftRightJointAngles(refMedDirect);
+      directAvg = averageJointDiff(userMed, refMedDirect);
+      swappedAvg = averageJointDiff(userMed, refMedSwapped);
+
+      if (sessionMirrorMappingRef.current === "pending") {
+        const lockSwapped = swappedAvg.avgDiff < directAvg.avgDiff;
+        const locked: SessionMirrorMapping = lockSwapped ? "lr_swapped" : "direct";
+        setSessionMirrorMapping(locked);
+        console.log(`[mirror] mirror locked: ${lockSwapped ? "swapped" : "direct"}`);
+      }
+      const useSwappedMapping =
+        sessionMirrorMappingRef.current === "pending"
+          ? swappedAvg.avgDiff < directAvg.avgDiff
+          : sessionMirrorMappingRef.current === "lr_swapped";
+      refMed = useSwappedMapping ? refMedSwapped : refMedDirect;
+      highlight = pickHighlightJointForChunkFeedback(userMed, userMedConf, refMed);
+
+      console.log("[chunk-drill] evaluation user median joint angles (from buffer)", userMed);
+      console.log("[chunk-drill] evaluation user median joint confidence (from buffer)", userMedConf);
+      console.log("[chunk-drill] mirror avg diff check", {
+        directAvgDiff: Number.isFinite(directAvg.avgDiff) ? Number(directAvg.avgDiff.toFixed(2)) : null,
+        swappedAvgDiff: Number.isFinite(swappedAvg.avgDiff) ? Number(swappedAvg.avgDiff.toFixed(2)) : null,
+        directJointsCompared: directAvg.jointsCompared,
+        swappedJointsCompared: swappedAvg.jointsCompared,
+      });
+      console.log("[chunk-drill] evaluation reference median joint angles (skeleton window)", refMedDirect);
+      console.log(
+        "[chunk-drill] evaluation reference mapping chosen",
+        useSwappedMapping ? "lr_swapped" : "direct"
+      );
+    }
+
+    console.log("[chunk-drill] evaluation mode", evaluationMode);
+
     if (Object.keys(userMed).length < 2) {
-      console.log("[chunk-drill] Claude: SKIPPED (insufficient user median joints)", {
+      console.log("[chunk-drill] Claude: SKIPPED (insufficient user joint coverage)", {
         jointCount: Object.keys(userMed).length,
       });
-      setCoachingNote("We couldn't capture enough pose data in that window — try again.");
-      // Keep the reference video paused while the user reads the feedback popup.
+      setChunkDrillFocusJoint(null);
+      setCoachingNote("We couldn't capture enough pose data in that window — try again or move on.");
       videoRef.current?.pause();
-      setLearnDrill((prev) => (prev ? { ...prev, step: "evaluate_fail" } : prev));
       return;
     }
-    const refMed = medianAnglesForSkeletonWindow(skeletonFrames, chunk.startMs, chunk.endMs);
-    console.log("[chunk-drill] evaluation reference median joint angles (skeleton window)", refMed);
+
     const diffsForLog = computeChunkJointDiffsForLog(userMed, refMed);
-    console.log("[chunk-drill] joint diffs before threshold check (°)", diffsForLog);
-    const cmp = compareChunkToReference(userMed, userMedConf, refMed, CHUNK_DRILL_THRESHOLD_DEG);
-    console.log("[chunk-drill] threshold check", {
-      thresholdDeg: CHUNK_DRILL_THRESHOLD_DEG,
-      worstAbsDiff: cmp.pass ? "(pass)" : cmp.worstDiff,
-      worstJoint: cmp.pass ? null : cmp.worstKey,
-      pass: cmp.pass,
+    console.log("[chunk-drill] joint diffs vs reference summary (°)", diffsForLog);
+    console.log("[chunk-drill] highlight joint (largest diff, coaching focus)", {
+      worstJoint: highlight?.worstKey ?? null,
+      worstAbsDiffDeg: highlight?.worstDiff != null ? Number(highlight.worstDiff.toFixed(2)) : null,
     });
-    if (cmp.pass) {
-      console.log("[chunk-drill] Claude: SKIPPED (chunk passed — all joints within threshold)");
-      console.log("[chunk-drill] STATE evaluate → nice_pass");
-      setLearnDrill((prev) => (prev ? { ...prev, step: "nice_pass" } : prev));
-      return;
-    }
+
+    setChunkDrillFocusJoint(highlight?.worstKey ?? null);
     const validJoints = Object.keys(userMed).filter((k) => userMed[k] !== 0);
     const fakeConf: Record<string, number> = {};
     for (const k of validJoints) fakeConf[k] = 0.5;
-    console.log("[chunk-drill] Claude: CALLING /coaching", {
+    const focusKey = highlight?.worstKey ?? validJoints[0] ?? JOINT_ANGLES[0]!.name;
+    console.log("[chunk-drill] Claude: CALLING /coaching (chunk feedback)", {
       segmentId: ld.segmentId,
-      focus_joint: cmp.worstKey,
-      diff_threshold_degrees: CHUNK_DRILL_THRESHOLD_DEG,
+      focus_joint: focusKey,
     });
     void sendCoachingRequest(
       ld.segmentId,
       userMed,
       fakeConf,
-      validJoints.length ? validJoints : [cmp.worstKey],
-      "needs_work",
+      validJoints.length ? validJoints : [focusKey],
+      "developing",
       "learn",
       {
-        focus_joint: cmp.worstKey,
-        diff_threshold_degrees: CHUNK_DRILL_THRESHOLD_DEG,
+        focus_joint: focusKey,
         reference_angle_summary_override: refMed,
       }
     );
-    console.log("[chunk-drill] STATE evaluate → evaluate_fail (awaiting coaching note)");
-    // Keep the reference video paused while the user reads the feedback popup.
     videoRef.current?.pause();
-    setLearnDrill((prev) => (prev ? { ...prev, step: "evaluate_fail" } : prev));
-  }, [learnDrill?.step, learnDrill?.chunkIndex, skeletonFrames.length, sendCoachingRequest]);
+  }, [
+    learnDrill?.step,
+    learnDrill?.chunkIndex,
+    learnDrill?.chunkAttemptsOnSlice,
+    skeletonFrames.length,
+    sendCoachingRequest,
+  ]);
 
-  // Pass sub-chunk: auto-advance after 2s
-  useEffect(() => {
-    if (!learnDrill || learnDrill.step !== "nice_pass") return;
-    console.log("[chunk-drill] STATE nice_pass (will advance in 2s)");
-    const t = window.setTimeout(() => {
-      setLearnDrill((prev) => {
-        if (!prev) return prev;
-        if (prev.chunkIndex + 1 >= prev.chunks.length) {
-          console.log("[chunk-drill] STATE nice_pass → put_together (all sub-chunks done)");
-          return { ...prev, step: "put_together" };
-        }
-        chunkEvaluateRanRef.current = false;
-        console.log("[chunk-drill] STATE nice_pass → preview", {
-          nextChunkIndex: prev.chunkIndex + 1,
-        });
-        return { ...prev, chunkIndex: prev.chunkIndex + 1, step: "preview" };
+  const moveToNextChunkFromFeedback = useCallback(() => {
+    const cur = learnDrillRef.current;
+    if (!cur || cur.step !== "chunk_feedback") return;
+    chunkFeedbackProcessedKeyRef.current = "";
+    setLearnDrill((prev) => {
+      if (!prev || prev.step !== "chunk_feedback") return prev;
+      if (prev.chunkIndex + 1 >= prev.chunks.length) {
+        console.log("[chunk-drill] STATE chunk_feedback → phrase_prep (countdown before full phrase)");
+        return { ...prev, step: "phrase_prep", chunkAttemptsOnSlice: 0 };
+      }
+      console.log("[chunk-drill] STATE chunk_feedback → preview", {
+        nextChunkIndex: prev.chunkIndex + 1,
       });
-    }, 2000);
+      return {
+        ...prev,
+        chunkIndex: prev.chunkIndex + 1,
+        step: "preview",
+        chunkAttemptsOnSlice: 0,
+      };
+    });
+    setCoachingNote(null);
+    setChunkDrillFocusJoint(null);
+    setChunkReviewPlayback(false);
+    replayJointsRef.current = null;
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+  }, []);
+
+  /** After 3 attempts on a sub-chunk, always advance (same as explicitly tapping Move on). */
+  useEffect(() => {
+    if (!learnDrill || learnDrill.step !== "chunk_feedback") return;
+    const n = learnDrill.chunkAttemptsOnSlice ?? 0;
+    if (n < 3) return;
+    const t = window.setTimeout(() => moveToNextChunkFromFeedback(), 1600);
     return () => clearTimeout(t);
-  }, [learnDrill?.step]);
+  }, [learnDrill?.step, learnDrill?.chunkIndex, learnDrill?.chunkAttemptsOnSlice, moveToNextChunkFromFeedback]);
 
   // Put it together: full phrase once at 1x, then stop (stay on same phrase selection)
   useEffect(() => {
@@ -1823,11 +2732,11 @@ export default function PlayerPage() {
         video.pause();
         video.removeEventListener("timeupdate", onTimeUpdate);
         learnCaptureRef.current = "none";
-        setLearnDrill(null);
-        learnDrillRef.current = null;
+        setLearnDrill((prev) => (prev ? { ...prev, step: "phrase_evaluate" } : prev));
         putTogetherStartedRef.current = false;
         setPreAttemptCountdownSec(null);
-        // Stay on the phrase the user practiced; do not auto-advance playback to the next phrase.
+        // Transition to full-phrase evaluation instead of nulling drill state
+        // (otherwise the auto-start effect restarts chunk 1 immediately).
       }
     };
     video.addEventListener("timeupdate", onTimeUpdate);
@@ -1835,6 +2744,38 @@ export default function PlayerPage() {
       video.removeEventListener("timeupdate", onTimeUpdate);
     };
   }, [learnDrill?.step, learnDrill?.segmentId, segments]);
+
+  // Full phrase evaluation (after put_together completes)
+  useEffect(() => {
+    if (!learnDrill || learnDrill.step !== "phrase_evaluate") return;
+    const seg = learnDrill.segment;
+    const userMed = getMedianAngles(putTogetherBufferRef.current);
+    const userMedConf: Record<string, number> = {};
+    for (const k of Object.keys(userMed)) userMedConf[k] = 0.5;
+
+    if (Object.keys(userMed).length < 2) {
+      const note = "We couldn't capture enough pose data for full-phrase evaluation. Try once more.";
+      setFullPhraseEvalResult({ pass: false, note });
+      setCoachingNote(note);
+      setCompletedLearnDrillSegmentId(seg.segment_id);
+      setLearnDrill((prev) => (prev ? { ...prev, step: "phrase_complete" } : prev));
+      return;
+    }
+
+    const refMedDirect = medianAnglesForSkeletonWindow(skeletonFrames, seg.start_time_ms, seg.end_time_ms);
+    const refMedSwapped = swapLeftRightJointAngles(refMedDirect);
+    const useSwapped = sessionMirrorMappingRef.current === "lr_swapped";
+    const refMed = useSwapped ? refMedSwapped : refMedDirect;
+    const cmp = compareChunkToReference(userMed, userMedConf, refMed, PHRASE_EVAL_THRESHOLD_DEG);
+
+    const note = cmp.pass
+      ? "Great full-phrase run. You're ready to move on."
+      : `Full phrase needs one more pass — biggest mismatch was ${cmp.worstLabel} (${cmp.worstDiff.toFixed(1)}deg off). Repeat the full phrase now, or go back through chunks for detail work.`;
+    setFullPhraseEvalResult({ pass: cmp.pass, note });
+    setCoachingNote(note);
+    setCompletedLearnDrillSegmentId(seg.segment_id);
+    setLearnDrill((prev) => (prev ? { ...prev, step: "phrase_complete" } : prev));
+  }, [learnDrill?.step, learnDrill?.segmentId, skeletonFrames.length]);
 
   // Pose comparison + coaching trigger effect - runs every 1 second using rolling buffer median
   useEffect(() => {
@@ -1914,7 +2855,7 @@ export default function PlayerPage() {
           : userMedianAngles;
       const directCmp = comparePoses(filteredUserAngles, refAnglesDirect);
       const swappedCmp = comparePoses(filteredUserAngles, refAnglesSwapped);
-      const useSwapped = useTestVideo && swappedCmp.score > directCmp.score;
+      const useSwapped = sessionMirrorMappingRef.current === "lr_swapped";
       const refAngles = useSwapped ? refAnglesSwapped : refAnglesDirect;
       const { score, worstJoint: worst, worstDiff, jointsCompared } = useSwapped ? swappedCmp : directCmp;
 
@@ -2097,8 +3038,7 @@ export default function PlayerPage() {
       !useTestVideo;
 
     // During chunk drill, we explicitly control `video` playback in the drill effects.
-    // Do not auto-play here when coaching notes appear (e.g. `evaluate_fail` popup),
-    // otherwise the reference video keeps moving underneath the feedback UI.
+    // Do not auto-play here when chunk feedback is showing — keep reference video paused under the card.
     if (isChunkDrillActive) {
       if (learnResumeTimerRef.current) {
         clearTimeout(learnResumeTimerRef.current);
@@ -2107,9 +3047,8 @@ export default function PlayerPage() {
       setLearnPausedForCoaching(false);
       if (
         learnDrill &&
-        (learnDrill.step === "evaluate" ||
-          learnDrill.step === "evaluate_fail" ||
-          learnDrill.step === "nice_pass")
+        (learnDrill.step === "phrase_prep" ||
+          (learnDrill.step === "chunk_feedback" && !chunkReviewPlayback))
       ) {
         video?.pause();
       }
@@ -2143,7 +3082,7 @@ export default function PlayerPage() {
         learnResumeTimerRef.current = null;
       }
     };
-  }, [coachingNote, practiceMode, practiceModeType, learnDrill, useTestVideo]);
+  }, [coachingNote, practiceMode, practiceModeType, learnDrill, useTestVideo, chunkReviewPlayback]);
 
   const setRate = useCallback((rate: 1 | 0.75 | 0.5) => {
     setPlaybackRate(rate);
@@ -2151,6 +3090,98 @@ export default function PlayerPage() {
       videoRef.current.playbackRate = rate;
     }
   }, []);
+
+  const attemptReviewDebugRows = useMemo(() => {
+    if (
+      !chunkReviewPlayback ||
+      !debugMode ||
+      !learnDrill ||
+      attemptReviewKeypoints.length === 0 ||
+      skeletonFrames.length === 0
+    ) {
+      return null;
+    }
+    const chunk = learnDrill.chunks[learnDrill.chunkIndex];
+    if (!chunk) return null;
+    const timeMs = reviewPlaybackTimeMs;
+    let bestKf = attemptReviewKeypoints[0];
+    let bd = Math.abs(bestKf.timestamp_ms - timeMs);
+    for (let i = 1; i < attemptReviewKeypoints.length; i++) {
+      const d = Math.abs(attemptReviewKeypoints[i].timestamp_ms - timeMs);
+      if (d < bd) {
+        bd = d;
+        bestKf = attemptReviewKeypoints[i];
+      }
+    }
+    const userAngles = calculateJointAngles(bestKf.joints);
+    const refDirect = interpolatedAnglesAtTime(skeletonFrames, timeMs);
+    const refSwapped = swapLeftRightJointAngles(refDirect);
+    const refAngles = sessionMirrorMapping === "lr_swapped" ? refSwapped : refDirect;
+
+    return JOINT_ANGLES.map(({ name, label }) => {
+      const u = userAngles[name];
+      const r = refAngles[name];
+      if (u === undefined || r === undefined) {
+        return {
+          name,
+          label,
+          user: null as number | null,
+          ref: null as number | null,
+          diff: null as number | null,
+          highlightFocus: null as boolean | null,
+        };
+      }
+      const diff = Math.abs(u - r);
+      return {
+        name,
+        label,
+        user: u,
+        ref: r,
+        diff,
+        highlightFocus: chunkDrillFocusJoint === name,
+      };
+    });
+  }, [
+    chunkReviewPlayback,
+    debugMode,
+    learnDrill,
+    attemptReviewKeypoints,
+    skeletonFrames,
+    reviewPlaybackTimeMs,
+    sessionMirrorMapping,
+    chunkDrillFocusJoint,
+  ]);
+
+  const stepReviewKeyframe = useCallback(
+    (delta: number) => {
+      const v = videoRef.current;
+      const kfs = attemptReviewKeypoints;
+      if (!v || kfs.length === 0) return;
+      const t = reviewPlaybackTimeMs;
+      let idx = 0;
+      let bestD = Infinity;
+      for (let i = 0; i < kfs.length; i++) {
+        const d = Math.abs(kfs[i].timestamp_ms - t);
+        if (d < bestD) {
+          bestD = d;
+          idx = i;
+        }
+      }
+      const next = Math.max(0, Math.min(kfs.length - 1, idx + delta));
+      v.currentTime = kfs[next].timestamp_ms / 1000;
+      setReviewPlaybackTimeMs(kfs[next].timestamp_ms);
+    },
+    [attemptReviewKeypoints, reviewPlaybackTimeMs]
+  );
+
+  const learnDrillBigCountdown =
+    practiceMode && learnDrill && !useTestVideo
+      ? phrasePrepCountdownSec != null && phrasePrepCountdownSec > 0
+        ? phrasePrepCountdownSec
+        : preAttemptCountdownSec != null && preAttemptCountdownSec > 0
+          ? preAttemptCountdownSec
+          : null
+      : null;
 
   if (loading) {
     return (
@@ -2333,6 +3364,30 @@ export default function PlayerPage() {
           >
             {skeletonLoading ? "Loading skeleton…" : "Show Reference Skeleton"}
           </button>
+          <button
+            type="button"
+            onClick={() => setIsReferenceMirrored((v) => !v)}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+              isReferenceMirrored
+                ? "bg-cyan-500/20 text-cyan-300"
+                : "bg-zinc-900 text-zinc-500 hover:text-zinc-300"
+            }`}
+            title="Mirror the reference video and keep replay orientation aligned"
+          >
+            {isReferenceMirrored ? "Reference Mirrored" : "Mirror Reference"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setDebugMode((d) => !d)}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+              debugMode
+                ? "bg-amber-500/25 text-amber-300 border border-amber-500/50"
+                : "bg-zinc-900 text-zinc-500 hover:text-zinc-300 border border-zinc-700"
+            }`}
+            title="Show attempt playback angle debug table and overlays"
+          >
+            {debugMode ? "Debug mode on" : "Debug mode off"}
+          </button>
           <QualityBadge score={overallScore} />
           <div className="flex items-center gap-2">
             {/* Learn / Dance mode toggle — always visible; active only in practice with webcam */}
@@ -2442,8 +3497,8 @@ export default function PlayerPage() {
       )}
 
       <div className="flex flex-1 min-h-0">
-        {/* Main content: video panels */}
-        <div className="flex-1 min-h-0 min-w-0 flex gap-2 p-2 sm:p-4 relative">
+        <div className="flex-1 min-h-0 min-w-0 flex flex-col gap-2 p-2 sm:p-4 min-h-0 overflow-hidden">
+          <div className="flex flex-1 min-h-0 gap-2 relative min-h-0">
           {/* Left: Reference video */}
           <div className={`${practiceMode && !useTestVideo ? "w-1/2" : "w-full"} h-full flex items-center justify-center transition-all`}>
             <div
@@ -2454,7 +3509,7 @@ export default function PlayerPage() {
                 ref={videoRef}
                 src={`${API_URL}/video/${jobId}`}
                 crossOrigin="anonymous"
-                className="absolute inset-0 w-full h-full object-contain"
+                className={`absolute inset-0 w-full h-full object-contain ${isReferenceMirrored ? "scale-x-[-1]" : ""}`}
                 controls
                 playsInline
                 onLoadedMetadata={() => {
@@ -2500,26 +3555,25 @@ export default function PlayerPage() {
                   <div>Mapping: {testDiagnostics.mappingMode === "lr_swapped" ? "L/R swapped" : "Direct"}</div>
                 </div>
               )}
-              {practiceMode &&
-                learnDrill &&
-                !useTestVideo &&
-                preAttemptCountdownSec !== null &&
-                preAttemptCountdownSec > 0 && (
-                  <div className="absolute inset-0 z-[25] flex items-center justify-center rounded-xl bg-black/50 pointer-events-none">
-                    <span className="text-7xl font-black tabular-nums text-white drop-shadow-lg">
-                      {preAttemptCountdownSec}
-                    </span>
-                  </div>
-                )}
+              {learnDrillBigCountdown != null && (
+                <div className="absolute inset-0 z-[25] flex items-center justify-center rounded-xl bg-black/50 pointer-events-none">
+                  <span className="text-7xl font-black tabular-nums text-white drop-shadow-lg">
+                    {learnDrillBigCountdown}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 
           {/* Center: Learn chunk drill OR coaching (test / dance has no live coaching text) */}
           {practiceMode && learnDrill && !useTestVideo ? (
+            learnFeedbackPanelVisible ? (
             <div className="absolute left-1/2 -translate-x-1/2 top-4 z-30 flex flex-col items-center pointer-events-none gap-2 w-full max-w-xl px-2">
               <div className="pointer-events-auto rounded-xl bg-black/80 border border-emerald-500/40 shadow-lg w-full px-5 py-4 text-left">
                 <div className="text-xs font-semibold uppercase tracking-wide text-emerald-300 mb-2">
-                  Learn drill — chunk {learnDrill.chunkIndex + 1} / {learnDrill.chunks.length}
+                  {learnDrill.step === "phrase_prep"
+                    ? "Learn drill — full phrase next"
+                    : `Learn drill — chunk ${learnDrill.chunkIndex + 1} / ${learnDrill.chunks.length}`}
                 </div>
                 {learnDrill.step === "preview" && (
                   <>
@@ -2554,35 +3608,134 @@ export default function PlayerPage() {
                     </p>
                   </>
                 )}
-                {learnDrill.step === "evaluate" && (
-                  <p className="text-sm text-zinc-300">Checking your move…</p>
-                )}
-                {learnDrill.step === "nice_pass" && (
-                  <p className="text-xl font-semibold text-emerald-300">Nice — moving on!</p>
-                )}
-                {learnDrill.step === "evaluate_fail" && (
+                {learnDrill.step === "chunk_feedback" && (
                   <>
-                    <p className="text-lg text-zinc-100 mb-3">{coachingNote ?? "Adjust and try again."}</p>
-                    {preAttemptCountdownSec !== null && preAttemptCountdownSec > 0 ? (
-                      <p className="text-center text-sm text-emerald-200 py-2">
-                        Get ready — recording starts after the countdown.
-                      </p>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={retryChunkAfterFail}
-                        className="w-full rounded-lg px-3 py-2 text-sm font-medium bg-zinc-700 text-white hover:bg-zinc-600 transition"
-                      >
-                        Try again
-                      </button>
-                    )}
+                    <p className="text-xs text-zinc-500 mb-2">
+                      Attempt {(learnDrill.chunkAttemptsOnSlice ?? 0)} of 3 on this slice
+                      {(learnDrill.chunkAttemptsOnSlice ?? 0) >= 3 ? " — moving on automatically…" : ""}
+                    </p>
+                    <p className="text-lg text-zinc-100 mb-3">
+                      {coachingLoading ? "Getting a coaching tip…" : coachingNote ?? "Review your replay below — yellow highlights the joint with the biggest gap vs the reference."}
+                    </p>
+                    <div className="mb-4 flex flex-wrap items-center gap-2">
+                      {attemptReviewKeypoints.length > 0 ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => setChunkReviewPlayback((v) => !v)}
+                            className={`rounded-lg px-3 py-2 text-sm font-medium transition border ${
+                              chunkReviewPlayback
+                                ? "bg-emerald-600 border-emerald-400 text-white"
+                                : "bg-zinc-800 border-zinc-600 text-zinc-100 hover:bg-zinc-700"
+                            }`}
+                          >
+                            Review my attempt
+                          </button>
+                          {chunkReviewPlayback && (
+                            <button
+                              type="button"
+                              onClick={() => setChunkReviewPlayback(false)}
+                              className="rounded-lg px-3 py-2 text-sm font-medium bg-zinc-700 text-white border border-zinc-500 hover:bg-zinc-600 transition"
+                            >
+                              Back to camera
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <p className="text-xs text-zinc-500">
+                          No pose replay — we didn&apos;t capture enough skeleton frames. Stay in frame for the full chunk and ensure lighting lets us see your body.
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      {preAttemptCountdownSec !== null && preAttemptCountdownSec > 0 ? (
+                        <p className="text-center text-sm text-emerald-200 py-2 sm:flex-1">
+                          Get ready — recording starts after the countdown.
+                        </p>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={retryChunkFromFeedback}
+                            disabled={(learnDrill.chunkAttemptsOnSlice ?? 0) >= 3}
+                            className="sm:flex-1 rounded-lg px-3 py-2 text-sm font-medium bg-zinc-700 text-white hover:bg-zinc-600 transition disabled:opacity-40 disabled:pointer-events-none"
+                          >
+                            Try again
+                          </button>
+                          <button
+                            type="button"
+                            onClick={moveToNextChunkFromFeedback}
+                            className="sm:flex-1 rounded-lg px-3 py-2 text-sm font-medium bg-emerald-500 text-white hover:bg-emerald-400 transition"
+                          >
+                            Move on
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </>
+                )}
+                {learnDrill.step === "phrase_prep" && (
+                  <>
+                    <p className="text-2xl font-semibold text-amber-200 mb-2">Get ready</p>
+                    <p className="text-sm text-zinc-300">
+                      Full phrase runs at full speed next. Step into frame and find your starting position — we&apos;ll
+                      count down from the number on the video.
+                    </p>
                   </>
                 )}
                 {learnDrill.step === "put_together" && (
                   <p className="text-xl font-semibold text-amber-200">Put it together — full speed, end to end</p>
                 )}
+                {learnDrill.step === "phrase_evaluate" && (
+                  <p className="text-sm text-zinc-300">Evaluating full phrase…</p>
+                )}
+                {learnDrill.step === "phrase_complete" && (
+                  <>
+                    <p className={`text-lg mb-3 ${fullPhraseEvalResult?.pass ? "text-emerald-300" : "text-zinc-100"}`}>
+                      {fullPhraseEvalResult?.note ?? "Full-phrase evaluation complete."}
+                    </p>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!learnDrillRef.current) return;
+                          setCompletedLearnDrillSegmentId(null);
+                          setFullPhraseEvalResult(null);
+                          setCoachingNote(null);
+                          setPhrasePrepCountdownSec(null);
+                          setLearnDrill((prev) =>
+                            prev ? { ...prev, step: "phrase_prep", chunkAttemptsOnSlice: 0 } : prev
+                          );
+                        }}
+                        className="sm:flex-1 rounded-lg px-3 py-2 text-sm font-medium bg-emerald-500 text-white hover:bg-emerald-400 transition"
+                      >
+                        Repeat full phrase
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!learnDrillRef.current) return;
+                          setCompletedLearnDrillSegmentId(null);
+                          setFullPhraseEvalResult(null);
+                          setCoachingNote(null);
+                          chunkFeedbackProcessedKeyRef.current = "";
+                          setPhrasePrepCountdownSec(null);
+                          setLearnDrill((prev) =>
+                            prev
+                              ? { ...prev, chunkIndex: 0, step: "preview", chunkAttemptsOnSlice: 0 }
+                              : prev
+                          );
+                        }}
+                        className="sm:flex-1 rounded-lg px-3 py-2 text-sm font-medium bg-zinc-700 text-white hover:bg-zinc-600 transition"
+                      >
+                        Redo chunks
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
+            ) : null
           ) : (
             practiceMode && (
               <div className="absolute left-1/2 -translate-x-1/2 top-4 z-30 flex flex-col items-center pointer-events-none gap-2">
@@ -2689,6 +3842,123 @@ export default function PlayerPage() {
               </div>
             </div>
           )}
+          </div>
+
+          {practiceMode &&
+            learnDrill &&
+            !useTestVideo &&
+            chunkReviewPlayback &&
+            !learnFeedbackPanelVisible &&
+            learnDrill.step === "chunk_feedback" && (
+              <div className="shrink-0 flex justify-center px-2 pb-1 pt-0.5 border-t border-zinc-800/80 bg-[#0d0d0d]/95">
+                <button
+                  type="button"
+                  onClick={() => setLearnFeedbackPanelVisible(true)}
+                  className="rounded-lg border border-emerald-500/45 bg-zinc-900 px-4 py-2 text-sm font-medium text-emerald-200 hover:bg-emerald-500/15 transition shadow-md"
+                >
+                  Show feedback & actions
+                </button>
+              </div>
+            )}
+
+          {chunkReviewPlayback &&
+            debugMode &&
+            learnDrill &&
+            attemptReviewDebugRows &&
+            practiceMode &&
+            !useTestVideo && (
+              <div className="shrink-0 rounded-xl border border-amber-500/40 bg-zinc-950/95 p-3 max-h-[40vh] overflow-auto">
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-amber-400">
+                    Attempt playback debug
+                  </span>
+                  <span className="text-[11px] font-mono text-zinc-500">
+                    t = {(reviewPlaybackTimeMs / 1000).toFixed(2)}s · phrase threshold {PHRASE_EVAL_THRESHOLD_DEG}° · mirror{" "}
+                    {sessionMirrorMapping === "lr_swapped" ? "swapped" : "direct"}
+                    {chunkDrillFocusJoint ? ` · focus ${chunkDrillFocusJoint}` : ""}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 mb-3">
+                  <button
+                    type="button"
+                    onClick={() => stepReviewKeyframe(-1)}
+                    className="rounded px-2 py-1 text-xs bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                  >
+                    ◀ Frame
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => stepReviewKeyframe(1)}
+                    className="rounded px-2 py-1 text-xs bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                  >
+                    Frame ▶
+                  </button>
+                  <label className="flex flex-1 items-center gap-2 min-w-[200px] text-xs text-zinc-400">
+                    Scrub
+                    <input
+                      type="range"
+                      className="flex-1 accent-amber-500"
+                      min={learnDrill.chunks[learnDrill.chunkIndex].startMs}
+                      max={learnDrill.chunks[learnDrill.chunkIndex].endMs}
+                      step={16}
+                      value={Math.min(
+                        Math.max(reviewPlaybackTimeMs, learnDrill.chunks[learnDrill.chunkIndex].startMs),
+                        learnDrill.chunks[learnDrill.chunkIndex].endMs
+                      )}
+                      onChange={(e) => {
+                        const ms = Number(e.target.value);
+                        const v = videoRef.current;
+                        if (v) v.currentTime = ms / 1000;
+                        setReviewPlaybackTimeMs(ms);
+                      }}
+                    />
+                  </label>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-[11px] border-collapse">
+                    <thead>
+                      <tr className="border-b border-zinc-700 text-zinc-500">
+                        <th className="py-1 pr-2 font-medium">Joint</th>
+                        <th className="py-1 pr-2 font-medium">Your angle</th>
+                        <th className="py-1 pr-2 font-medium">Reference angle</th>
+                        <th className="py-1 pr-2 font-medium">Diff</th>
+                        <th className="py-1 font-medium">Highlight</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {attemptReviewDebugRows.map((row) => (
+                        <tr
+                          key={row.name}
+                          className={`border-b border-zinc-800/80 ${
+                            chunkDrillFocusJoint === row.name ? "bg-amber-500/10" : ""
+                          }`}
+                        >
+                          <td className="py-1 pr-2 text-zinc-300 capitalize">{row.label}</td>
+                          <td className="py-1 pr-2 font-mono text-zinc-200">
+                            {row.user != null ? row.user.toFixed(1) : "—"}
+                          </td>
+                          <td className="py-1 pr-2 font-mono text-zinc-200">
+                            {row.ref != null ? row.ref.toFixed(1) : "—"}
+                          </td>
+                          <td className="py-1 pr-2 font-mono text-zinc-200">
+                            {row.diff != null ? row.diff.toFixed(1) : "—"}
+                          </td>
+                          <td className="py-1">
+                            {row.highlightFocus === null ? (
+                              <span className="text-zinc-600">—</span>
+                            ) : row.highlightFocus ? (
+                              <span className="text-amber-300">Focus</span>
+                            ) : (
+                              <span className="text-zinc-500">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
         </div>
 
         {/* Segments sidebar */}
