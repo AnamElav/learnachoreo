@@ -71,7 +71,7 @@ export default function Home() {
         }
       }, 3000);
     },
-    [stopPolling]
+    [router, stopPolling]
   );
 
   const handleSubmit = async (e: React.FormEvent) => {

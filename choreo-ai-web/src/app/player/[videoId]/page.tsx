@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
+import { PhraseReview } from "@/components/PhraseReview";
+import { supabase } from "@/lib/supabase/client";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -733,7 +735,7 @@ type LearnDrillStep =
   | "chunk_feedback"
   | "phrase_prep"
   | "put_together"
-  | "phrase_evaluate"
+  | "phrase_review"
   | "phrase_complete";
 
 interface LearnDrillState {
@@ -910,6 +912,11 @@ export default function PlayerPage() {
   const [skeletonFrames, setSkeletonFrames] = useState<SkeletonFrame[]>([]);
   const [skeletonLoading, setSkeletonLoading] = useState(false);
 
+  // Supabase auth (for the user menu)
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [signOutLoading, setSignOutLoading] = useState(false);
+
   // Webcam state
   const [practiceMode, setPracticeMode] = useState(false);
   const [webcamLoading, setWebcamLoading] = useState(false);
@@ -944,6 +951,51 @@ export default function PlayerPage() {
   const loopIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Keep the top-bar user menu in sync with auth state.
+  useEffect(() => {
+    let mounted = true;
+
+    async function load() {
+      setAuthLoading(true);
+      try {
+        const { data, error } = await supabase.auth.getUser();
+        if (!mounted) return;
+        if (error) setUserEmail(null);
+        else setUserEmail(data.user?.email ?? null);
+      } catch {
+        if (!mounted) return;
+        setUserEmail(null);
+      } finally {
+        if (!mounted) return;
+        setAuthLoading(false);
+      }
+    }
+
+    void load();
+
+    const { data: sub } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        setUserEmail(session?.user?.email ?? null);
+        setAuthLoading(false);
+      }
+    );
+
+    return () => {
+      mounted = false;
+      sub.subscription.unsubscribe();
+    };
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    setSignOutLoading(true);
+    try {
+      await supabase.auth.signOut();
+      router.replace("/auth/login");
+    } finally {
+      setSignOutLoading(false);
+    }
+  }, [router]);
 
   // Webcam refs
   const webcamRef = useRef<HTMLVideoElement | null>(null);
@@ -983,6 +1035,9 @@ export default function PlayerPage() {
   /** Raw MoveNet joints + capture timestamp per inference frame during chunk attempts. */
   const learnAttemptKeypointsBufferRef = useRef<RecordedAttemptKeyframe[]>([]);
   const putTogetherBufferRef = useRef<Record<string, number>[]>([]);
+  /** Keyframed webcam poses during full-phrase run (Learn put_together). */
+  const putTogetherKeyframesRef = useRef<RecordedAttemptKeyframe[]>([]);
+  const putTogetherSmoothedRef = useRef<Record<string, { x: number; y: number }> | null>(null);
   const learnCaptureRef = useRef<"none" | "chunk_attempt" | "put_together">("none");
   /** Last chunk feedback run key `${chunkIndex}-${attemptOnSlice}` — avoids duplicate processing. */
   const chunkFeedbackProcessedKeyRef = useRef<string>("");
@@ -1005,6 +1060,19 @@ export default function PlayerPage() {
   preAttemptCountdownRef.current = preAttemptCountdownSec;
   /** 5 → ... → 1 before full-phrase "put it together" starts after the last chunk. */
   const [phrasePrepCountdownSec, setPhrasePrepCountdownSec] = useState<number | null>(null);
+
+  /** Keyframes copied when entering phrase_review (Learn full phrase). */
+  const [phraseReviewLearnKeyframes, setPhraseReviewLearnKeyframes] = useState<RecordedAttemptKeyframe[]>([]);
+
+  /** Dance mode: keyed poses for whichever phrase window the video is playing. */
+  const dancePhraseKeyframesRef = useRef<RecordedAttemptKeyframe[]>([]);
+  const dancePhraseSmoothedRef = useRef<Record<string, { x: number; y: number }> | null>(null);
+  const [phraseReviewDance, setPhraseReviewDance] = useState<{
+    segment: Segment;
+    keyframes: RecordedAttemptKeyframe[];
+  } | null>(null);
+  const phraseReviewDanceRef = useRef<{ segment: Segment; keyframes: RecordedAttemptKeyframe[] } | null>(null);
+  phraseReviewDanceRef.current = phraseReviewDance;
 
   /** Saved keyframes from the last chunk attempt — used for synced post-attempt review playback. */
   const [attemptReviewKeypoints, setAttemptReviewKeypoints] = useState<RecordedAttemptKeyframe[]>([]);
@@ -1132,6 +1200,12 @@ export default function PlayerPage() {
     queuedAttemptStartRef.current = false;
     setPreAttemptCountdownSec(null);
     setPhrasePrepCountdownSec(null);
+    putTogetherKeyframesRef.current = [];
+    putTogetherSmoothedRef.current = null;
+    setPhraseReviewLearnKeyframes([]);
+    dancePhraseKeyframesRef.current = [];
+    dancePhraseSmoothedRef.current = null;
+    setPhraseReviewDance(null);
   }, []);
 
   const playSegment = useCallback(
@@ -1610,6 +1684,13 @@ export default function PlayerPage() {
     setSessionMirrorMapping("pending");
     setCompletedLearnDrillSegmentId(null);
     setFullPhraseEvalResult(null);
+    putTogetherKeyframesRef.current = [];
+    putTogetherSmoothedRef.current = null;
+    setPhraseReviewLearnKeyframes([]);
+    dancePhraseKeyframesRef.current = [];
+    dancePhraseSmoothedRef.current = null;
+    setPhraseReviewDance(null);
+    setPhrasePrepCountdownSec(null);
   }, []);
 
   const endDanceSession = useCallback(async () => {
@@ -1995,6 +2076,37 @@ export default function PlayerPage() {
             });
           }
 
+          if (
+            practiceModeType === "dance" &&
+            learnCaptureRef.current === "none" &&
+            !learnDrillRef.current &&
+            !phraseReviewDanceRef.current &&
+            skeletonFrames.length > 0
+          ) {
+            const tMs = (videoRef.current?.currentTime ?? 0) * 1000;
+            const seg =
+              activeSegmentId != null
+                ? segments.find(
+                    (s) =>
+                      s.segment_id === activeSegmentId &&
+                      tMs >= s.start_time_ms &&
+                      tMs <= s.end_time_ms
+                  )
+                : segments.find((s) => tMs >= s.start_time_ms && tMs <= s.end_time_ms);
+            if (seg) {
+              const arr = dancePhraseKeyframesRef.current;
+              const lastTs = arr.length ? arr[arr.length - 1]?.timestamp_ms : -Infinity;
+              if (tMs - lastTs >= 76) {
+                const smoothedDance = smoothJointsEma(joints, dancePhraseSmoothedRef.current, 0.3);
+                dancePhraseSmoothedRef.current = smoothedDance;
+                dancePhraseKeyframesRef.current.push({
+                  timestamp_ms: tMs,
+                  joints: { ...smoothedDance },
+                });
+              }
+            }
+          }
+
           // Calculate angles — learn chunk / put-together use dedicated buffers
           const angles = calculateJointAngles(joints);
           if (Object.keys(angles).length > 0) {
@@ -2002,6 +2114,13 @@ export default function PlayerPage() {
               learnAttemptBufferRef.current.push(angles);
             } else if (learnCaptureRef.current === "put_together") {
               putTogetherBufferRef.current.push(angles);
+              const smoothedPut = smoothJointsEma(joints, putTogetherSmoothedRef.current, 0.3);
+              putTogetherSmoothedRef.current = smoothedPut;
+              const tMs = (videoRef.current?.currentTime ?? 0) * 1000;
+              const pk = putTogetherKeyframesRef.current;
+              if (pk.length === 0 || tMs - (pk[pk.length - 1]?.timestamp_ms ?? 0) >= 72) {
+                putTogetherKeyframesRef.current.push({ timestamp_ms: tMs, joints: { ...smoothedPut } });
+              }
             } else {
               jointAnglesBufferRef.current.push(angles);
               if (jointAnglesBufferRef.current.length > BUFFER_SIZE) {
@@ -2040,7 +2159,8 @@ export default function PlayerPage() {
             (ldGate &&
               (ldGate.step === "preview" ||
                 ldGate.step === "chunk_feedback" ||
-                ldGate.step === "phrase_prep"));
+                ldGate.step === "phrase_prep" ||
+                ldGate.step === "phrase_review"));
           if (
             !suppressLostBodyGate &&
             !positioningActive &&
@@ -2072,7 +2192,16 @@ export default function PlayerPage() {
         cancelAnimationFrame(webcamRafRef.current);
       }
     };
-  }, [practiceMode, detectorReady, useTestVideo, isReferenceMirrored]);
+  }, [
+    practiceMode,
+    detectorReady,
+    useTestVideo,
+    isReferenceMirrored,
+    practiceModeType,
+    activeSegmentId,
+    segments,
+    skeletonFrames.length,
+  ]);
 
   // Positioning preflight: require ankles visible before starting session
   useEffect(() => {
@@ -2718,6 +2847,8 @@ export default function PlayerPage() {
       phraseMs: { start: seg.start_time_ms, end: seg.end_time_ms },
     });
     putTogetherBufferRef.current = [];
+    putTogetherKeyframesRef.current = [];
+    putTogetherSmoothedRef.current = null;
     learnCaptureRef.current = "put_together";
     setPlaybackRate(1);
     video.playbackRate = 1;
@@ -2732,11 +2863,9 @@ export default function PlayerPage() {
         video.pause();
         video.removeEventListener("timeupdate", onTimeUpdate);
         learnCaptureRef.current = "none";
-        setLearnDrill((prev) => (prev ? { ...prev, step: "phrase_evaluate" } : prev));
+        setLearnDrill((prev) => (prev ? { ...prev, step: "phrase_review" } : prev));
         putTogetherStartedRef.current = false;
         setPreAttemptCountdownSec(null);
-        // Transition to full-phrase evaluation instead of nulling drill state
-        // (otherwise the auto-start effect restarts chunk 1 immediately).
       }
     };
     video.addEventListener("timeupdate", onTimeUpdate);
@@ -2745,10 +2874,15 @@ export default function PlayerPage() {
     };
   }, [learnDrill?.step, learnDrill?.segmentId, segments]);
 
-  // Full phrase evaluation (after put_together completes)
   useEffect(() => {
-    if (!learnDrill || learnDrill.step !== "phrase_evaluate") return;
-    const seg = learnDrill.segment;
+    if (learnDrill?.step !== "phrase_review") return;
+    setPhraseReviewLearnKeyframes([...putTogetherKeyframesRef.current]);
+  }, [learnDrill?.step, learnDrill?.segmentId]);
+
+  const finalizeLearnPhraseReview = useCallback(() => {
+    const ld = learnDrillRef.current;
+    if (!ld || ld.step !== "phrase_review") return;
+    const seg = ld.segment;
     const userMed = getMedianAngles(putTogetherBufferRef.current);
     const userMedConf: Record<string, number> = {};
     for (const k of Object.keys(userMed)) userMedConf[k] = 0.5;
@@ -2757,25 +2891,68 @@ export default function PlayerPage() {
       const note = "We couldn't capture enough pose data for full-phrase evaluation. Try once more.";
       setFullPhraseEvalResult({ pass: false, note });
       setCoachingNote(note);
-      setCompletedLearnDrillSegmentId(seg.segment_id);
-      setLearnDrill((prev) => (prev ? { ...prev, step: "phrase_complete" } : prev));
-      return;
+    } else {
+      const refMedDirect = medianAnglesForSkeletonWindow(skeletonFrames, seg.start_time_ms, seg.end_time_ms);
+      const refMedSwapped = swapLeftRightJointAngles(refMedDirect);
+      const useSwapped = sessionMirrorMappingRef.current === "lr_swapped";
+      const refMed = useSwapped ? refMedSwapped : refMedDirect;
+      const cmp = compareChunkToReference(userMed, userMedConf, refMed, PHRASE_EVAL_THRESHOLD_DEG);
+
+      const note = cmp.pass
+        ? "Great full-phrase run. You're ready to move on."
+        : `Full phrase needs one more pass — biggest mismatch was ${cmp.worstLabel} (${cmp.worstDiff.toFixed(1)}deg off). Repeat the full phrase now, or go back through chunks for detail work.`;
+      setFullPhraseEvalResult({ pass: cmp.pass, note });
+      setCoachingNote(note);
     }
 
-    const refMedDirect = medianAnglesForSkeletonWindow(skeletonFrames, seg.start_time_ms, seg.end_time_ms);
-    const refMedSwapped = swapLeftRightJointAngles(refMedDirect);
-    const useSwapped = sessionMirrorMappingRef.current === "lr_swapped";
-    const refMed = useSwapped ? refMedSwapped : refMedDirect;
-    const cmp = compareChunkToReference(userMed, userMedConf, refMed, PHRASE_EVAL_THRESHOLD_DEG);
-
-    const note = cmp.pass
-      ? "Great full-phrase run. You're ready to move on."
-      : `Full phrase needs one more pass — biggest mismatch was ${cmp.worstLabel} (${cmp.worstDiff.toFixed(1)}deg off). Repeat the full phrase now, or go back through chunks for detail work.`;
-    setFullPhraseEvalResult({ pass: cmp.pass, note });
-    setCoachingNote(note);
     setCompletedLearnDrillSegmentId(seg.segment_id);
-    setLearnDrill((prev) => (prev ? { ...prev, step: "phrase_complete" } : prev));
-  }, [learnDrill?.step, learnDrill?.segmentId, skeletonFrames.length]);
+    putTogetherBufferRef.current = [];
+    putTogetherKeyframesRef.current = [];
+    putTogetherSmoothedRef.current = null;
+    setPhraseReviewLearnKeyframes([]);
+    setLearnDrill((prev) => (prev && prev.step === "phrase_review" ? { ...prev, step: "phrase_complete" } : prev));
+  }, [skeletonFrames]);
+
+  // Dance: after each phrase end, optional moment review overlay
+  useEffect(() => {
+    if (!practiceMode || useTestVideo || practiceModeType !== "dance") return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    let prevT = video.currentTime * 1000;
+
+    const onTimeUpdate = () => {
+      const t = video.currentTime * 1000;
+      if (phraseReviewDanceRef.current) {
+        prevT = t;
+        return;
+      }
+      if (Math.abs(t - prevT) > 2500) {
+        prevT = t;
+        return;
+      }
+
+      for (const seg of segments) {
+        const wasInside = prevT >= seg.start_time_ms && prevT <= seg.end_time_ms;
+        const crossedEnd = wasInside && prevT <= seg.end_time_ms && t > seg.end_time_ms;
+        if (crossedEnd) {
+          const inside = [...dancePhraseKeyframesRef.current].filter(
+            (k) => k.timestamp_ms >= seg.start_time_ms && k.timestamp_ms <= seg.end_time_ms
+          );
+          dancePhraseKeyframesRef.current = [];
+          dancePhraseSmoothedRef.current = null;
+          setPhraseReviewDance({ segment: seg, keyframes: inside });
+          prevT = t;
+          video.pause();
+          return;
+        }
+      }
+      prevT = t;
+    };
+
+    video.addEventListener("timeupdate", onTimeUpdate);
+    return () => video.removeEventListener("timeupdate", onTimeUpdate);
+  }, [practiceMode, useTestVideo, practiceModeType, segments]);
 
   // Pose comparison + coaching trigger effect - runs every 1 second using rolling buffer median
   useEffect(() => {
@@ -2982,10 +3159,13 @@ export default function PlayerPage() {
     } else {
       // older API shape
       const handler = pickVoice as unknown as () => void;
-      (synth as any).onvoiceschanged = handler;
+      const synthWithOnVoicesChanged = synth as unknown as {
+        onvoiceschanged?: null | (() => void);
+      };
+      synthWithOnVoicesChanged.onvoiceschanged = handler;
       return () => {
-        if ((synth as any).onvoiceschanged === handler) {
-          (synth as any).onvoiceschanged = null;
+        if (synthWithOnVoicesChanged.onvoiceschanged === handler) {
+          synthWithOnVoicesChanged.onvoiceschanged = null;
         }
       };
     }
@@ -3048,6 +3228,7 @@ export default function PlayerPage() {
       if (
         learnDrill &&
         (learnDrill.step === "phrase_prep" ||
+          learnDrill.step === "phrase_review" ||
           (learnDrill.step === "chunk_feedback" && !chunkReviewPlayback))
       ) {
         video?.pause();
@@ -3409,6 +3590,7 @@ export default function PlayerPage() {
                     setPracticeModeType(mode);
                     setSuggestDanceMode(false);
                     if (mode === "dance") {
+                      setShowSkeleton(true);
                       setLearnDrill(null);
                       learnDrillRef.current = null;
                       learnCaptureRef.current = "none";
@@ -3486,6 +3668,42 @@ export default function PlayerPage() {
               </svg>
               <span>{ttsEnabled ? "Voice on" : "Voice off"}</span>
             </button>
+            <div className="flex items-center gap-2 rounded-lg bg-zinc-900/70 border border-zinc-800 px-3 py-1.5">
+              {authLoading ? (
+                <span className="text-[11px] text-zinc-600">Loading…</span>
+              ) : userEmail ? (
+                <>
+                  <span className="text-[11px] text-zinc-300 max-w-[180px] truncate">
+                    {userEmail}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleSignOut}
+                    disabled={signOutLoading}
+                    className={`px-2.5 py-1 text-[11px] font-medium rounded transition border ${
+                      signOutLoading
+                        ? "bg-zinc-800 border-zinc-700 text-zinc-400 cursor-not-allowed"
+                        : "bg-zinc-700 border-zinc-500 text-white hover:bg-zinc-600"
+                    }`}
+                  >
+                    {signOutLoading ? "Signing out..." : "Sign out"}
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => router.push(`/auth/login?next=${encodeURIComponent(videoId ? `/player/${videoId}` : "/")}`)}
+                  disabled={authLoading}
+                  className={`px-2.5 py-1 text-[11px] font-medium rounded transition border ${
+                    authLoading
+                      ? "bg-zinc-800 border-zinc-700 text-zinc-400 cursor-not-allowed"
+                      : "bg-zinc-700 border-zinc-500 text-white hover:bg-zinc-600"
+                  }`}
+                >
+                  Sign in
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -3686,8 +3904,8 @@ export default function PlayerPage() {
                 {learnDrill.step === "put_together" && (
                   <p className="text-xl font-semibold text-amber-200">Put it together — full speed, end to end</p>
                 )}
-                {learnDrill.step === "phrase_evaluate" && (
-                  <p className="text-sm text-zinc-300">Evaluating full phrase…</p>
+                {learnDrill.step === "phrase_review" && (
+                  <p className="text-sm text-zinc-400">Review your phrase highlights in the overlay above.</p>
                 )}
                 {learnDrill.step === "phrase_complete" && (
                   <>
@@ -3746,6 +3964,7 @@ export default function PlayerPage() {
                       type="button"
                       onClick={() => {
                         setPracticeModeType("dance");
+                        setShowSkeleton(true);
                         setSuggestDanceMode(false);
                         setPlaybackRate(1);
                         if (videoRef.current) videoRef.current.playbackRate = 1;
@@ -3990,6 +4209,45 @@ export default function PlayerPage() {
           </div>
         </aside>
       </div>
+
+      {learnDrill?.step === "phrase_review" && learnDrill && (
+        <PhraseReview
+          jobId={jobId}
+          segment={{
+            segment_id: learnDrill.segment.segment_id,
+            start_time_ms: learnDrill.segment.start_time_ms,
+            end_time_ms: learnDrill.segment.end_time_ms,
+          }}
+          skeletonFrames={skeletonFrames}
+          userKeyframes={phraseReviewLearnKeyframes}
+          mirrorMapping={sessionMirrorMapping === "lr_swapped" ? "lr_swapped" : "direct"}
+          practiceModeSide="learn"
+          videoRef={videoRef}
+          isReferenceMirrored={isReferenceMirrored}
+          onGotIt={finalizeLearnPhraseReview}
+        />
+      )}
+
+      {phraseReviewDance && (
+        <PhraseReview
+          jobId={jobId}
+          segment={{
+            segment_id: phraseReviewDance.segment.segment_id,
+            start_time_ms: phraseReviewDance.segment.start_time_ms,
+            end_time_ms: phraseReviewDance.segment.end_time_ms,
+          }}
+          skeletonFrames={skeletonFrames}
+          userKeyframes={phraseReviewDance.keyframes}
+          mirrorMapping={sessionMirrorMapping === "lr_swapped" ? "lr_swapped" : "direct"}
+          practiceModeSide="dance"
+          videoRef={videoRef}
+          isReferenceMirrored={isReferenceMirrored}
+          onGotIt={() => {
+            setPhraseReviewDance(null);
+            void videoRef.current?.play();
+          }}
+        />
+      )}
     </div>
   );
 }
