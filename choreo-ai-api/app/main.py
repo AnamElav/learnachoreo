@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 from pathlib import Path
+from datetime import datetime, timezone
 
 try:
     from dotenv import load_dotenv
@@ -30,6 +31,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.config import REDIS_URL, OUTPUTS_DIR, SKELETONS_DIR
+from app.supabase_client import get_supabase_client
 from app.tasks import process_video, set_job_status, JOB_KEY_PREFIX
 
 app = FastAPI(title="Choreo AI API", version="0.1.0")
@@ -104,9 +106,12 @@ def _validate_youtube_url(url: str) -> None:
 
 
 class CoachingRequest(BaseModel):
+    user_id: str  # Supabase auth.users.id
+    video_id: str
     segment_id: int
     reference_angle_summary: dict[str, float]
     user_angles: dict[str, float]
+    worst_moments: list[dict] | None = None  # top-3 worst frame dicts (from frontend)
     user_joint_confidence: dict[str, float] | None = None
     valid_joints: list[str] | None = None
     match_level: str  # "good", "developing", "needs_work"
@@ -130,6 +135,152 @@ class PerformanceReviewResponse(BaseModel):
 
 class CoachingResponse(BaseModel):
     note: str
+
+
+def _avg_abs_joint_diff(body: CoachingRequest) -> float:
+    diffs: list[float] = []
+    for key, ref_angle in body.reference_angle_summary.items():
+        if ref_angle is None:
+            continue
+        user_angle = body.user_angles.get(key)
+        if user_angle is None:
+            user_angle = body.user_angles.get(key.lower())
+        if user_angle is None:
+            continue
+        try:
+            diffs.append(abs(float(user_angle) - float(ref_angle)))
+        except Exception:
+            continue
+    if not diffs:
+        return 0.0
+    return sum(diffs) / len(diffs)
+
+
+def _persist_coaching_to_supabase(
+    body: CoachingRequest,
+    note_text: str,
+    overall_score: float,
+    focus_joint_diff: float | None,
+) -> None:
+    """
+    Best-effort persistence path. Any error should be handled by caller so
+    coaching response is never blocked.
+    """
+    sb = get_supabase_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # 1) find/create session by user_id + video_id
+    session_rows = (
+        sb.table("user_sessions")
+        .select("id")
+        .eq("user_id", body.user_id)
+        .eq("video_id", body.video_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if session_rows:
+        session_id = session_rows[0]["id"]
+    else:
+        session_insert = (
+            sb.table("user_sessions")
+            .insert({"user_id": body.user_id, "video_id": body.video_id})
+            .execute()
+            .data
+        )
+        if not session_insert:
+            raise RuntimeError("Failed to create user_sessions row")
+        session_id = session_insert[0]["id"]
+
+    # 2) insert phrase_attempts
+    existing_attempts = (
+        sb.table("phrase_attempts")
+        .select("id")
+        .eq("session_id", session_id)
+        .eq("segment_id", body.segment_id)
+        .execute()
+        .data
+    )
+    attempt_number = len(existing_attempts) + 1
+    worst_moments = body.worst_moments or []
+    pa_insert = (
+        sb.table("phrase_attempts")
+        .insert(
+            {
+                "session_id": session_id,
+                "segment_id": body.segment_id,
+                "attempt_number": attempt_number,
+                "worst_moments": worst_moments,
+                "overall_score": overall_score,
+            }
+        )
+        .execute()
+        .data
+    )
+    if not pa_insert:
+        raise RuntimeError("Failed to create phrase_attempts row")
+    phrase_attempt_id = pa_insert[0]["id"]
+
+    # 3) insert coaching_notes
+    worst_ts_ms = None
+    if worst_moments:
+        first = worst_moments[0]
+        if isinstance(first, dict):
+            raw_ts = first.get("timestamp_ms")
+            if raw_ts is not None:
+                try:
+                    worst_ts_ms = int(raw_ts)
+                except Exception:
+                    worst_ts_ms = None
+
+    sb.table("coaching_notes").insert(
+        {
+            "phrase_attempt_id": phrase_attempt_id,
+            "joint_name": (body.focus_joint or "").upper() if body.focus_joint else "UNKNOWN",
+            "note_text": note_text,
+            "timestamp_ms": worst_ts_ms,
+        }
+    ).execute()
+
+    # 4) upsert user_joint_history with rolling average
+    joint_name = (body.focus_joint or "").upper() if body.focus_joint else "UNKNOWN"
+    new_diff = float(focus_joint_diff if focus_joint_diff is not None else overall_score)
+    existing_hist = (
+        sb.table("user_joint_history")
+        .select("id, avg_diff, attempt_count")
+        .eq("user_id", body.user_id)
+        .eq("video_id", body.video_id)
+        .eq("joint_name", joint_name)
+        .limit(1)
+        .execute()
+        .data
+    )
+
+    if existing_hist:
+        row = existing_hist[0]
+        existing_avg = float(row.get("avg_diff") or 0.0)
+        existing_count = int(row.get("attempt_count") or 0)
+        next_count = existing_count + 1
+        next_avg = ((existing_avg * existing_count) + new_diff) / next_count
+        sb.table("user_joint_history").update(
+            {
+                "avg_diff": next_avg,
+                "attempt_count": next_count,
+                "last_seen_at": now_iso,
+            }
+        ).eq("id", row["id"]).execute()
+    else:
+        sb.table("user_joint_history").insert(
+            {
+                "user_id": body.user_id,
+                "video_id": body.video_id,
+                "joint_name": joint_name,
+                "avg_diff": new_diff,
+                "attempt_count": 1,
+                "last_seen_at": now_iso,
+            }
+        ).execute()
 
 
 ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
@@ -394,6 +545,31 @@ async def generate_coaching_note(body: CoachingRequest):
                 if i != -1:
                     note = note[: i + 1].strip()
                     break
+
+        overall_score = _avg_abs_joint_diff(body)
+        focus_joint_diff: float | None = None
+        if body.focus_joint:
+            fk = body.focus_joint.upper()
+            user_v = body.user_angles.get(fk) or body.user_angles.get(fk.lower())
+            ref_v = body.reference_angle_summary.get(fk) or body.reference_angle_summary.get(
+                fk.lower()
+            )
+            if user_v is not None and ref_v is not None:
+                try:
+                    focus_joint_diff = abs(float(user_v) - float(ref_v))
+                except Exception:
+                    focus_joint_diff = None
+
+        try:
+            _persist_coaching_to_supabase(
+                body=body,
+                note_text=note,
+                overall_score=overall_score,
+                focus_joint_diff=focus_joint_diff,
+            )
+        except Exception as persist_exc:
+            # Never fail coaching response because of persistence errors.
+            print(f"[coaching][supabase] persistence failed: {persist_exc}")
 
         return CoachingResponse(note=note)
 

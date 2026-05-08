@@ -34,6 +34,9 @@ function formatTimeLabel(ms: number) {
 
 export type PhraseReviewProps = {
   apiUrl?: string;
+  /** Supabase auth user id (required for `/coaching` + session persistence) */
+  userId: string | null;
+  videoId: string | undefined;
   jobId: string | null;
   segment: PhraseReviewSegmentMeta;
   skeletonFrames: SkeletonFrame[];
@@ -45,6 +48,17 @@ export type PhraseReviewProps = {
   isReferenceMirrored: boolean;
   onGotIt: () => void;
 };
+
+function worstMomentsToPayload(moments: PhraseMomentSnapshot[]): Record<string, unknown>[] {
+  return moments.map((m) => ({
+    timestamp_ms: m.timestamp_ms,
+    worst_joint_key: m.worstJointKey,
+    worst_joint_label: m.worstJointLabel,
+    total_diff_deg: m.totalDiffDeg,
+    user_deg: m.userDeg,
+    ref_deg: m.refDeg,
+  }));
+}
 
 function buildMomentReferenceAngleOverride(
   skeletonFrames: SkeletonFrame[],
@@ -99,7 +113,9 @@ function dominantMomentNearTime(
 
 async function fetchCoachingSentence(opts: {
   apiUrl: string;
-  jobId: string;
+  userId: string;
+  videoId: string;
+  worstMoments: Record<string, unknown>[];
   segmentId: number;
   worstJointUpper: string;
   userAngles: Record<string, number>;
@@ -112,7 +128,10 @@ async function fetchCoachingSentence(opts: {
   for (const k of keys) fakeConf[k] = 0.5;
   const valid = keys.filter((k) => opts.userAngles[k] !== undefined);
   const body: Record<string, unknown> = {
+    user_id: opts.userId,
+    video_id: opts.videoId,
     segment_id: opts.segmentId,
+    worst_moments: opts.worstMoments,
     reference_angle_summary: opts.refAnglesOverride,
     user_angles: opts.userAngles,
     user_joint_confidence: fakeConf,
@@ -153,6 +172,8 @@ function letterboxedVideoRects(
 
 export function PhraseReview({
   apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000",
+  userId,
+  videoId,
   jobId,
   segment,
   skeletonFrames,
@@ -214,7 +235,25 @@ export function PhraseReview({
       };
     }
 
-    const jobIdForApi: string = jid;
+    if (!userId || !videoId) {
+      const t = window.setTimeout(() => {
+        if (cancelled) return;
+        setNotes(
+          moments.map(
+            () => "Sign in and reload to load phrase coaching notes and save session data."
+          )
+        );
+        setLoadingNotes(false);
+      }, 0);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(t);
+      };
+    }
+
+    const uid = userId;
+    const vid = videoId;
+    const wmPayload = worstMomentsToPayload(moments);
     const ac = new AbortController();
 
     async function load() {
@@ -227,7 +266,9 @@ export function PhraseReview({
 
         const note = await fetchCoachingSentence({
           apiUrl,
-          jobId: jobIdForApi,
+          userId: uid,
+          videoId: vid,
+          worstMoments: wmPayload,
           segmentId: segment.segment_id,
           worstJointUpper: m.worstJointKey,
           userAngles,
@@ -244,7 +285,17 @@ export function PhraseReview({
     void load();
 
     return () => ac.abort();
-  }, [apiUrl, jobId, moments, segment.segment_id, skeletonFrames, mirrorMapping, practiceModeSide]);
+  }, [
+    apiUrl,
+    jobId,
+    userId,
+    videoId,
+    moments,
+    segment.segment_id,
+    skeletonFrames,
+    mirrorMapping,
+    practiceModeSide,
+  ]);
 
   const leftWrapRef = useRef<HTMLDivElement>(null);
   const rightWrapRef = useRef<HTMLDivElement>(null);

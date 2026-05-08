@@ -56,3 +56,23 @@ docker compose -f choreo-ai-api/docker-compose.yml up --build
 - Redis: localhost:6379  
 
 Pipeline outputs are written under `/data` in the containers (volume `pipeline_and_outputs`). Completed jobs: `/data/outputs/{job_id}/choreo_data.json`.
+
+## Railway environment variables
+
+Set these in Railway for the API service:
+
+- `ANTHROPIC_API_KEY`
+- `REDIS_URL` (or Railway-provided Redis URL)
+- `OUTPUTS_DIR`
+- `DATA_DIR`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+## Local persistence (Supabase)
+
+Session writes from `POST /coaching` require server-side vars. **`NEXT_PUBLIC_SUPABASE_*` in the Next app is not enough** — the FastAPI process must receive:
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+Put them in the **repository root** `.env` and/or **`choreo-ai-api/.env`** (same files `app/main.py` loads via python-dotenv). `start_local.sh` also shellsources those paths so Celery/Uvicorn inherit them before startup.

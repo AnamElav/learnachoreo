@@ -913,6 +913,7 @@ export default function PlayerPage() {
   const [skeletonLoading, setSkeletonLoading] = useState(false);
 
   // Supabase auth (for the user menu)
+  const [userId, setUserId] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [signOutLoading, setSignOutLoading] = useState(false);
@@ -961,10 +962,16 @@ export default function PlayerPage() {
       try {
         const { data, error } = await supabase.auth.getUser();
         if (!mounted) return;
-        if (error) setUserEmail(null);
-        else setUserEmail(data.user?.email ?? null);
+        if (error) {
+          setUserId(null);
+          setUserEmail(null);
+        } else {
+          setUserId(data.user?.id ?? null);
+          setUserEmail(data.user?.email ?? null);
+        }
       } catch {
         if (!mounted) return;
+        setUserId(null);
         setUserEmail(null);
       } finally {
         if (!mounted) return;
@@ -976,6 +983,7 @@ export default function PlayerPage() {
 
     const { data: sub } = supabase.auth.onAuthStateChange(
       (_event, session) => {
+        setUserId(session?.user?.id ?? null);
         setUserEmail(session?.user?.email ?? null);
         setAuthLoading(false);
       }
@@ -2289,7 +2297,7 @@ export default function PlayerPage() {
         reference_angle_summary_override?: Record<string, number>;
       }
     ) => {
-      if (!jobId) return;
+      if (!jobId || !videoId || !userId) return;
 
       const segment = segments.find((s) => s.segment_id === segmentId);
       const reference_angle_summary =
@@ -2299,6 +2307,8 @@ export default function PlayerPage() {
         setCoachingLoading(true);
 
         const body: Record<string, unknown> = {
+          user_id: userId,
+          video_id: videoId,
           segment_id: segmentId,
           reference_angle_summary,
           user_angles: userMedianAngles,
@@ -2337,7 +2347,7 @@ export default function PlayerPage() {
         setCoachingLoading(false);
       }
     },
-    [jobId, segments]
+    [jobId, segments, userId, videoId]
   );
 
   const beginChunkAttempt = useCallback((ld: LearnDrillState) => {
@@ -4212,6 +4222,8 @@ export default function PlayerPage() {
 
       {learnDrill?.step === "phrase_review" && learnDrill && (
         <PhraseReview
+          userId={userId}
+          videoId={videoId}
           jobId={jobId}
           segment={{
             segment_id: learnDrill.segment.segment_id,
@@ -4230,6 +4242,8 @@ export default function PlayerPage() {
 
       {phraseReviewDance && (
         <PhraseReview
+          userId={userId}
+          videoId={videoId}
           jobId={jobId}
           segment={{
             segment_id: phraseReviewDance.segment.segment_id,

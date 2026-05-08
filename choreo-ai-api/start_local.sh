@@ -23,6 +23,12 @@ else
 fi
 
 export PYTHONPATH="$REPO_ROOT"
+# Load env files into the shell so uvicorn/celery see SUPABASE_* and other secrets.
+# Prefer repo root `.env`, then choreo-ai-api `.env`. (Matches python-dotenv in `app/main.py`.)
+set -a
+[[ -f "$REPO_ROOT/.env" ]] && . "$REPO_ROOT/.env" || true
+[[ -f "$SCRIPT_DIR/.env" ]] && . "$SCRIPT_DIR/.env" || true
+set +a
 export REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}"
 export DATA_DIR="${DATA_DIR:-$REPO_ROOT/data}"
 export OUTPUTS_DIR="${OUTPUTS_DIR:-$REPO_ROOT/data/outputs}"
