@@ -156,6 +156,27 @@ def _avg_abs_joint_diff(body: CoachingRequest) -> float:
     return sum(diffs) / len(diffs)
 
 
+_COACHING_NOTE_SKIP_PHRASES = (
+    "looking good",
+    "keep it up",
+    "great work",
+    "nice work",
+    "well done",
+    "spot on",
+)
+
+
+def _should_skip_coaching_notes_insert(match_level: str | None, note_text: str) -> bool:
+    """True when there is nothing corrective worth storing as a coaching_note row."""
+    if (match_level or "").lower() == "good":
+        return True
+    text = (note_text or "").strip()
+    if not text:
+        return True
+    lower = text.lower()
+    return any(phrase in lower for phrase in _COACHING_NOTE_SKIP_PHRASES)
+
+
 def _persist_coaching_to_supabase(
     body: CoachingRequest,
     note_text: str,
@@ -222,7 +243,7 @@ def _persist_coaching_to_supabase(
         raise RuntimeError("Failed to create phrase_attempts row")
     phrase_attempt_id = pa_insert[0]["id"]
 
-    # 3) insert coaching_notes
+    # 3) insert coaching_notes (skip when evaluation passed or note is praise-only)
     worst_ts_ms = None
     if worst_moments:
         first = worst_moments[0]
@@ -234,14 +255,17 @@ def _persist_coaching_to_supabase(
                 except Exception:
                     worst_ts_ms = None
 
-    sb.table("coaching_notes").insert(
-        {
-            "phrase_attempt_id": phrase_attempt_id,
-            "joint_name": (body.focus_joint or "").upper() if body.focus_joint else "UNKNOWN",
-            "note_text": note_text,
-            "timestamp_ms": worst_ts_ms,
-        }
-    ).execute()
+    if _should_skip_coaching_notes_insert(body.match_level, note_text):
+        print("skipping coaching_notes insert — positive feedback, nothing to correct")
+    else:
+        sb.table("coaching_notes").insert(
+            {
+                "phrase_attempt_id": phrase_attempt_id,
+                "joint_name": (body.focus_joint or "").upper() if body.focus_joint else "UNKNOWN",
+                "note_text": note_text,
+                "timestamp_ms": worst_ts_ms,
+            }
+        ).execute()
 
     # 4) upsert user_joint_history with rolling average
     joint_name = (body.focus_joint or "").upper() if body.focus_joint else "UNKNOWN"

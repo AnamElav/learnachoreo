@@ -2297,7 +2297,12 @@ export default function PlayerPage() {
         reference_angle_summary_override?: Record<string, number>;
       }
     ) => {
-      if (!jobId || !videoId || !userId) return;
+      if (!jobId || !videoId) return;
+
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user?.id) return;
 
       const segment = segments.find((s) => s.segment_id === segmentId);
       const reference_angle_summary =
@@ -2307,7 +2312,7 @@ export default function PlayerPage() {
         setCoachingLoading(true);
 
         const body: Record<string, unknown> = {
-          user_id: userId,
+          user_id: user.id,
           video_id: videoId,
           segment_id: segmentId,
           reference_angle_summary,
@@ -2347,7 +2352,7 @@ export default function PlayerPage() {
         setCoachingLoading(false);
       }
     },
-    [jobId, segments, userId, videoId]
+    [jobId, segments, videoId]
   );
 
   const beginChunkAttempt = useCallback((ld: LearnDrillState) => {

@@ -4,9 +4,8 @@ import { NextResponse, type NextRequest } from "next/server";
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Public routes
+  // Public routes (auth only — home requires login)
   if (
-    pathname === "/" ||
     pathname === "/auth/login" ||
     pathname === "/auth/signup" ||
     pathname.startsWith("/auth/login/") ||
