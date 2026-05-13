@@ -25,12 +25,13 @@ if _dotenv_available:
 
 import redis
 import httpx
+import anthropic
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-from app.config import REDIS_URL, OUTPUTS_DIR, SKELETONS_DIR
+from app.config import MCP_SERVER_URL, REDIS_URL, OUTPUTS_DIR, SKELETONS_DIR
 from app.supabase_client import get_supabase_client
 from app.tasks import process_video, set_job_status, JOB_KEY_PREFIX
 
@@ -81,7 +82,7 @@ async def ensure_cors_on_errors(request: Request, call_next):
 
 # Loose YouTube URL check
 YOUTUBE_PATTERN = re.compile(
-    r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w-]+",
+    r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+",
     re.IGNORECASE,
 )
 
@@ -101,7 +102,7 @@ def _validate_youtube_url(url: str) -> None:
     if not YOUTUBE_PATTERN.match(url):
         raise HTTPException(
             status_code=400,
-            detail="Invalid YouTube URL; expected format like https://www.youtube.com/watch?v=... or https://youtu.be/...",
+            detail="Invalid YouTube URL; expected format like https://www.youtube.com/watch?v=..., https://youtu.be/..., or https://www.youtube.com/shorts/...",
         )
 
 
@@ -307,7 +308,72 @@ def _persist_coaching_to_supabase(
         ).execute()
 
 
-ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+SYSTEM_PROMPT = (
+    "You are an adaptive dance coach with access to a dancer's history. You have tools to check which joints have "
+    "been persistently problematic, what feedback has already been given, and whether the dancer is improving or stuck "
+    "on specific joints. Always check persistent errors and phrase history before giving feedback so you don't repeat "
+    "yourself and can reference the dancer's progress. Give one specific, encouraging coaching note in 1-2 sentences "
+    "that references their history where relevant — e.g. 'Your left elbow has been the main challenge across your last "
+    "3 attempts — try thinking of it as pushing your elbow toward the ceiling rather than just lifting your arm.' "
+    "Never give generic feedback. If a joint is improving, acknowledge it."
+)
+
+_MCP_BETA = "mcp-client-2025-11-20"
+
+
+def _text_from_beta_message(response: "anthropic.types.beta.BetaMessage") -> str:
+    parts: list[str] = []
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            t = getattr(block, "text", None)
+            if t:
+                parts.append(str(t).strip())
+    return " ".join(parts).strip()
+
+
+async def _coaching_via_anthropic_mcp(api_key: str, user_message: str) -> str:
+    """
+    Coaching note via Claude MCP connector (remote LearnAChoreo history server).
+    Uses beta Messages API: mcp_servers + mcp_toolset + mcp-client beta.
+    MCP endpoint: ``MCP_SERVER_URL`` from the environment (see ``app.config``; default local dev URL).
+    """
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+    mcp_url = MCP_SERVER_URL
+    print(f"[coaching][anthropic] MCP server URL: {mcp_url!r}", flush=True)
+    response = await client.beta.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=1000,
+        betas=[_MCP_BETA],
+        mcp_servers=[
+            {
+                "type": "url",
+                "url": mcp_url,
+                "name": "learnachoreo-history",
+            }
+        ],
+        tools=[{"type": "mcp_toolset", "mcp_server_name": "learnachoreo-history"}],
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_message}],
+        timeout=120.0,
+    )
+    print(
+        f"[coaching][anthropic] stop_reason={response.stop_reason!r} "
+        f"usage={getattr(response, 'usage', None)!r}",
+        flush=True,
+    )
+    try:
+        dump = response.model_dump_json(indent=2)
+        max_log = 12000
+        print(
+            "=== Claude coaching response (truncated) ===\n"
+            + (dump if len(dump) <= max_log else dump[:max_log] + "\n... [truncated]"),
+            flush=True,
+        )
+    except Exception as log_exc:
+        print(f"[coaching][anthropic] could not log response: {log_exc}", flush=True)
+    return _text_from_beta_message(response)
 
 
 def _get_anthropic_api_key() -> str:
@@ -458,7 +524,11 @@ async def generate_coaching_note(body: CoachingRequest):
         )
 
     prompt = (
-        f"You are a supportive dance teacher giving real-time feedback to a {body.skill_level} dancer.\n\n"
+        "## Current attempt context\n"
+        f"user_id: {body.user_id}\n"
+        f"video_id: {body.video_id}\n"
+        f"segment_id: {body.segment_id}\n\n"
+        f"You are giving real-time feedback to a {body.skill_level} dancer.\n\n"
         f"They are practicing phrase {body.segment_id} of a {style} choreography.\n\n"
         f"{valid_note}\n\n"
         "Joint angle differences (positive = over-extending, negative = under-extending):\n"
@@ -506,51 +576,7 @@ async def generate_coaching_note(body: CoachingRequest):
     print("=== End prompt ===")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": ANTHROPIC_MODEL,
-                    "max_tokens": 150,
-                    "system": (
-                        "You are a supportive dance teacher. Always respond with 1–2 short sentences of coaching. "
-                        "When the dancer missed the target (needs_work), prioritize clear corrective cues over generic praise."
-                    ),
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        }
-                    ],
-                },
-            )
-
-        # Log raw response text for debugging (even on non-2xx to help diagnose)
-        print("=== Claude raw response ===")
-        print(resp.text)
-        print("=== End response ===")
-
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Anthropic messages API: content is a list of blocks; we expect the first to be text
-        note = ""
-        try:
-            blocks = data.get("content") or []
-            if blocks and isinstance(blocks, list):
-                first = blocks[0]
-                # Support either {"type":"text","text": "..."} or plain string just in case
-                if isinstance(first, dict) and "text" in first:
-                    note = str(first["text"]).strip()
-                else:
-                    note = str(first).strip()
-        except Exception:
-            note = ""
+        note = await _coaching_via_anthropic_mcp(api_key, prompt)
 
         if not note:
             if match_level_norm == "needs_work" and body.focus_joint:
@@ -597,7 +623,7 @@ async def generate_coaching_note(body: CoachingRequest):
 
         return CoachingResponse(note=note)
 
-    except httpx.HTTPError as exc:
+    except anthropic.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Error calling Claude API: {exc}") from exc
 
 
